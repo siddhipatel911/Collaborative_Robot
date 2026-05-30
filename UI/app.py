@@ -2,7 +2,18 @@ from flask import Flask, Response, send_from_directory
 import cv2
 import threading
 import os
+import sys
 import time
+
+# Prefer the camera index used in calibrateCamera.py (external camera)
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+try:
+    import calibrateCamera
+    CAMERA_INDEX = getattr(calibrateCamera, 'CAMERA_INDEX', 0)
+except Exception:
+    CAMERA_INDEX = 0
 
 app = Flask(__name__, static_folder='.', template_folder='.')
 
@@ -14,7 +25,10 @@ def index():
 def styles():
     return send_from_directory('.', 'styles.css')
 
-def mjpeg_generator(device=0):
+def mjpeg_generator(device=None):
+    # default to external camera index from calibrateCamera.py
+    if device is None:
+        device = CAMERA_INDEX
     ui_latest = os.path.join(os.path.dirname(__file__), 'latest.jpg')
     cap = cv2.VideoCapture(device)
     try:
