@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Collaborative Robot Demo</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div class="bg"></div>
+  <header class="site-header">
+    <h1>Collaborative Robot Demo</h1>
+    <p class="subtitle">Camera-assisted pick & place with human-aware pacing</p>
+  </header>
+
+  <main class="content">
+    <div class="camera-card">
+      <img id="mjpeg" alt="camera stream" style="display:none;width:100%;height:100%;object-fit:cover;" />
+      <video id="camera" autoplay playsinline muted style="display:none;width:100%;height:100%;object-fit:cover;"></video>
+      <div class="camera-overlay">Live Camera</div>
+    </div>
+
+    <section class="description">
+      <h2>About this project</h2>
+      <p>
+        This demo shows a simple proof-of-concept for a collaborative robot that watches a placement
+        zone using an overhead camera, detects coloured blocks, and performs pick-and-place operations.
+        The system adapts pace and behaviour according to user presence and a simple mood/personality
+        model. Use this page to preview the camera feed while running the robot software.
+      </p>
+      <p>
+        Usage: allow camera access when prompted. If the camera is unavailable the page will show the
+        background image instead. For local testing you can open this file directly in a browser or serve
+        it with a minimal HTTP server (instructions in README).
+      </p>
+    </section>
+  </main>
+
+  <script>
+    // Try MJPEG stream first (served by ui/app.py at /stream). If not available, fall back to getUserMedia.
+    function tryMjpegThenGetUserMedia() {
+      const mjpeg = document.getElementById('mjpeg');
+      const video = document.getElementById('camera');
+
+      // Probe the MJPEG endpoint by loading it into an Image object
+      const probe = new Image();
+      let timedOut = false;
+      const timeout = setTimeout(() => { timedOut = true; probe.src = ''; probe.onload = probe.onerror = null; startGetUserMedia(); }, 1200);
+
+      probe.onload = () => {
+        if (timedOut) return;
+        clearTimeout(timeout);
+        // MJPEG is available
+        mjpeg.src = '/stream';
+        mjpeg.style.display = '';
+      };
+      probe.onerror = () => {
+        if (timedOut) return;
+        clearTimeout(timeout);
+        startGetUserMedia();
+      };
+      // Start probing
+      probe.src = '/stream';
+
+      async function startGetUserMedia() {
+        try {
+          const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+          video.srcObject = stream;
+          video.style.display = '';
+        } catch (err) {
+          document.querySelector('.camera-card').classList.add('no-camera');
+          video.style.display = 'none';
+          const note = document.createElement('div');
+          note.className = 'no-camera-note';
+          note.innerText = 'Camera access denied or not available. Background image shown.';
+          document.querySelector('.camera-card').appendChild(note);
+        }
+      }
+    }
+
+    tryMjpegThenGetUserMedia();
+  </script>
+</body>
+</html>
