@@ -9,7 +9,7 @@ import numpy as np
 
 Z_SAFE = 40
 Z_PICK = -25
-DROP_X, DROP_Y = 200, 3000
+DROP_X, DROP_Y = 250, 150
 HOLD_FRAMES = 8
 MISS_LIMIT = 5
 MIN_CONTOUR_AREA = 400
@@ -17,14 +17,20 @@ PICK_PROXIMITY_PX = 30
 MAX_PICKS = 3
 
 # Only pick blocks within this pixel zone around center
-PICK_ZONE_RADIUS = 50
+PICK_ZONE_RADIUS = 100
 
 COLOUR_HSV = {
-    "green": ([(35, 90, 80), (75, 255, 255)],),
+    "green":  ([(45, 80, 80),   (80, 255, 255)],),
+    "teal":   ([(95, 80, 80),   (120, 255, 255)],),
+    "blue":   ([(125, 40, 80),  (150, 255, 255)],),
+    "purple": ([(160, 80, 80),  (180, 255, 255)],),
 }
 
 COLOUR_BGR = {
-    "green": (0, 255, 0),
+    "green":  (0, 255, 0),
+    "teal":   (255, 255, 0),
+    "blue":   (255, 0, 0),
+    "purple": (255, 0, 255),
 }
 
 # ── Camera setup ──
@@ -36,6 +42,18 @@ if not cap.isOpened():
     exit(1)
 
 cv2.namedWindow("Camera", cv2.WINDOW_NORMAL)
+cv2.namedWindow("Mask", cv2.WINDOW_NORMAL)
+cv2.resizeWindow("Mask", 320, 240)
+
+def mouse_hsv(event, x, y, flags, param):
+    if event == cv2.EVENT_LBUTTONDOWN:
+        hsv = cv2.cvtColor(param["frame"], cv2.COLOR_BGR2HSV)
+        h, s, v = hsv[y, x]
+        b, g, r = param["frame"][y, x]
+        print(f"[CLICK] pixel ({x},{y}) — BGR({b},{g},{r})  HSV({h},{s},{v})")
+
+mouse_data = {"frame": None}
+cv2.setMouseCallback("Camera", mouse_hsv, mouse_data)
 
 # ── Load calibration for undistortion (helps detection) ──
 try:
@@ -60,6 +78,7 @@ CENTER_X, CENTER_Y = 180, 0
 print(f"[ROBOT] Moving to center ({CENTER_X}, {CENTER_Y}, {Z_SAFE})...")
 dobotArm.move_to_xyz(api, CENTER_X, CENTER_Y, Z_SAFE)
 print("\n[READY] Place a block under the arm. It will auto-pick.")
+print("       Left-click a pixel to see its HSV value.")
 print("       Press Q to quit.\n")
 
 # ── Helpers ──
@@ -69,21 +88,21 @@ def detect_blocks(frame):
         frame = cv2.remap(frame, map1, map2, cv2.INTER_LINEAR)
     hsv = cv2.cvtColor(cv2.GaussianBlur(frame, (3, 3), 0), cv2.COLOR_BGR2HSV)
     blocks = []
+    combined_mask = np.zeros(frame.shape[:2], dtype=np.uint8)
     for colour, ranges in COLOUR_HSV.items():
-        mask = np.zeros(frame.shape[:2], dtype=np.uint8)
         for r in ranges:
             lower = np.array(r[0], dtype=np.uint8)
             upper = np.array(r[1], dtype=np.uint8)
-            mask = cv2.bitwise_or(mask, cv2.inRange(hsv, lower, upper))
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        for c in contours:
-            if cv2.contourArea(c) > MIN_CONTOUR_AREA:
-                M = cv2.moments(c)
-                if M["m00"]:
-                    cx, cy = int(M["m10"] / M["m00"]), int(M["m01"] / M["m00"])
-                    blocks.append((cx, cy, colour))
-    return blocks
+            combined_mask = cv2.bitwise_or(combined_mask, cv2.inRange(hsv, lower, upper))
+    mask = cv2.morphologyEx(combined_mask, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    for c in contours:
+        if cv2.contourArea(c) > MIN_CONTOUR_AREA:
+            M = cv2.moments(c)
+            if M["m00"]:
+                cx, cy = int(M["m10"] / M["m00"]), int(M["m01"] / M["m00"])
+                blocks.append((cx, cy, colour))
+    return blocks, mask
 
 def matches(block, block_list):
     bx, by, bc = block
@@ -108,7 +127,8 @@ while True:
     else:
         display = frame.copy()
 
-    blocks = detect_blocks(frame)
+    mouse_data["frame"] = display
+    blocks, mask = detect_blocks(frame)
 
     # Only consider blocks near center of frame
     cx, cy = display.shape[1] // 2, display.shape[0] // 2
@@ -128,6 +148,7 @@ while True:
     cv2.putText(display, f"Blocks: {len(near_blocks)}", (10, 30),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
     cv2.imshow("Camera", display)
+    cv2.imshow("Mask", mask)
 
     key = cv2.waitKey(1) & 0xFF
     if key == ord('q'):
