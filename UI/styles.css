@@ -1,0 +1,26 @@
+/* Simple, responsive one-page UI styles */
+:root{
+  --accent: #1b6ca8;
+  --bg-color: #0f1720;
+  --card-bg: rgba(255,255,255,0.06);
+  --glass: rgba(255,255,255,0.06);
+  --text: #e6eef6;
+}
+html,body{height:100%;margin:0;font-family:Inter,system-ui,-apple-system,Segoe UI,Roboto,"Helvetica Neue",Arial;color:var(--text);background:var(--bg-color)}
+.bg{
+  position:fixed;inset:0;background-image: url('../assets/IMG_6706.jpeg');background-size:cover;background-position:center;filter:brightness(0.5);z-index:0;
+}
+.site-header{position:relative;z-index:2;padding:28px 24px 8px 24px;text-align:center}
+.site-header h1{margin:0;font-size:28px;letter-spacing:0.4px}
+.subtitle{margin:6px 0 0 0;color:rgba(230,238,246,0.8)}
+.content{position:relative;z-index:2;display:flex;flex-direction:column;align-items:center;gap:20px;padding:12px 18px 40px}
+.camera-card{width:780px;max-width:92vw;height:440px;background:var(--card-bg);border-radius:10px;display:flex;align-items:center;justify-content:center;position:relative;overflow:hidden;box-shadow:0 6px 24px rgba(0,0,0,0.6)}
+.camera-card video{width:100%;height:100%;object-fit:cover;display:block}
+.camera-overlay{position:absolute;left:12px;top:12px;background:rgba(0,0,0,0.45);padding:6px 10px;border-radius:6px;font-weight:600}
+.no-camera-note{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);background:rgba(0,0,0,0.6);padding:12px 16px;border-radius:8px}
+.description{width:780px;max-width:92vw;background:linear-gradient(180deg, rgba(255,255,255,0.03), rgba(255,255,255,0.01));padding:18px;border-radius:10px}
+.description h2{margin:0 0 8px 0}
+.description p{margin:6px 0 0 0;line-height:1.5;color:rgba(230,238,246,0.9)}
+@media (max-width:640px){
+  .camera-card{height:320px}
+}

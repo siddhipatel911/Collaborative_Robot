@@ -46,6 +46,7 @@ import numpy as np
 import cv2
 import time
 from collections import deque
+import os
 
 
 # ══════════════════════════ MEDIAPIPE SETUP ══════════════════════════
@@ -92,8 +93,8 @@ COLOUR_BGR = {
 # -- Placement zone (pixel coordinates on the camera image) --
 # The green rectangle drawn on-screen. Only blocks whose centroid falls
 # inside this rectangle are considered for picking.
-PZ_X1, PZ_Y1 = 150, 150   # top-left corner
-PZ_X2, PZ_Y2 = 500, 500   # bottom-right corner
+PZ_X1, PZ_Y1 = 50, 20   # top-left corner
+PZ_X2, PZ_Y2 = 650, 315   # bottom-right corner
 WINDOW_NAME = "Collaborative Robot Demo"
 
 # -- Speed adaptation --
@@ -720,6 +721,24 @@ def main():
 
         # ── Show the annotated camera frame ──
         cv2.imshow(WINDOW_NAME, display)
+
+        # Export a JPEG for the UI server to show (atomic write)
+        try:
+            ui_dir = os.path.join(os.path.dirname(__file__), 'ui')
+            os.makedirs(ui_dir, exist_ok=True)
+            tmp_path = os.path.join(ui_dir, 'latest.jpg.tmp')
+            out_path = os.path.join(ui_dir, 'latest.jpg')
+            ret_jpg, jpg = cv2.imencode('.jpg', display, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+            if ret_jpg:
+                with open(tmp_path, 'wb') as f:
+                    f.write(jpg.tobytes())
+                try:
+                    os.replace(tmp_path, out_path)
+                except Exception:
+                    with open(out_path, 'wb') as f:
+                        f.write(jpg.tobytes())
+        except Exception:
+            pass
 
     # ── Cleanup on quit ──
     cap.release()
