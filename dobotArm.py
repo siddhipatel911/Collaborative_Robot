@@ -190,3 +190,12 @@ def stop_pump(api):
     """
     dType.SetEndEffectorSuctionCup(api, 1, 0, 0)[0]
     dType.dSleep(50)
+
+
+def start_pump(api):
+    # Start the suction pump (enable = 1, suction = 1)
+    # This is a minimal wrapper so code can use either gripper or suction depending on hardware.
+    dType.SetEndEffectorSuctionCup(api, 1, 1, 0)[0]
+    # small delay to allow pump to spool up
+    dType.dSleep(200)
+

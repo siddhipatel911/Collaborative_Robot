@@ -114,11 +114,10 @@ MOOD_MODIFIERS = {
     "no_face":  1.0,
 }
 
-# -- Block tracking --
-HOLD_FRAMES = 8           # number of consecutive frames a block must be visible
-                          #   before we commit to picking it (debounces hand movement)
-PICK_PROXIMITY_PX = 30    # blocks within this many pixels of a previously-picked
-                          #   block are considered the same one
+HOLD_FRAMES = 8
+PICK_PROXIMITY_PX = 30  # blocks within this many pixels are considered the same
+PICK_RETRY_COUNT = 2
+PICK_RAISE_CHECK = -15  # raise to this Z to perform a quick pickup check
 
 
 # ══════════════════════════ MOOD ANALYSER ══════════════════════════
@@ -598,15 +597,66 @@ def main():
             dobotArm.move_to_xyz(api, rx, ry, Z_SAFE)
             state = "pick_lower"
 
-        # ── PICK: Lower to Z_PICK, then grip ──
+        # ── PICK: Lower to Z_PICK, then grip with verification & retries ──
         elif state == "pick_lower":
             rx, ry = target_robot
             print(f"[PICK LOWER] ({rx:.1f}, {ry:.1f}, Z={Z_PICK})")
             dobotArm.move_to_xyz(api, rx, ry, Z_PICK)
-            print("[GRIPPER] Closing...")
-            dobotArm.close_gripper(api)
-            print("[GRIPPER] Closed")
-            state = "pick_rise"
+
+            # Try closing gripper and verify by raising and re-checking presence visually.
+            success = False
+            for attempt in range(PICK_RETRY_COUNT + 1):
+                print(f"[GRIPPER] Closing... (attempt {attempt+1})")
+                dobotArm.close_gripper(api)
+                # Raise slightly to clear surface for a quick check
+                dobotArm.move_to_xyz(api, rx, ry, PICK_RAISE_CHECK)
+
+                # Minimal visual check: capture a frame and test if color still present near pixel
+                ret_chk, chk_frame = cap.read()
+                if ret_chk:
+                    chk_frame = cv2.remap(chk_frame, map1, map2, cv2.INTER_LINEAR)
+                    hsv = cv2.cvtColor(cv2.GaussianBlur(chk_frame, (3, 3), 0), cv2.COLOR_BGR2HSV)
+                    x_px, y_px = int(target_pixel[0]), int(target_pixel[1])
+                    x0, y0 = max(0, x_px - 8), max(0, y_px - 8)
+                    x1, y1 = min(hsv.shape[1]-1, x_px + 8), min(hsv.shape[0]-1, y_px + 8)
+                    roi = hsv[y0:y1, x0:x1]
+                    ranges = COLOUR_HSV.get(target_colour, ())
+                    still_there = False
+                    for r in ranges:
+                        m = cv2.inRange(roi, np.array(r[0]), np.array(r[1]))
+                        if cv2.countNonZero(m) > 50:
+                            still_there = True
+                            break
+
+                else:
+                    still_there = True
+
+                if not still_there:
+                    print("[PICK VERIFY] block no longer visible in ROI → assumed picked")
+                    success = True
+                    break
+
+                # optional: try suction if available on second attempt
+                if attempt == 0:
+                    try:
+                        dobotArm.start_pump(api)
+                        print("[PICK] Started pump to assist grip")
+                    except Exception:
+                        pass
+
+                # if not successful, reopen and try again
+                dobotArm.open_gripper(api)
+                dobotArm.move_to_xyz(api, rx, ry, Z_PICK)
+
+            if not success:
+                print("[ERROR] Failed to pick block after retries — skipping this block")
+                # mark as picked to avoid infinite loop and return to watching
+                if target_pixel is not None:
+                    picked_ids.add((target_pixel[0], target_pixel[1], target_colour))
+                state = "watching"
+            else:
+                print("[GRIPPER] Pick assumed successful")
+                state = "pick_rise"
 
         # ── PICK: Rise back to Z_SAFE (block is now gripped) ──
         elif state == "pick_rise":

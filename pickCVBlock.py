@@ -15,26 +15,23 @@
 #Other Useful Codes you can use:
 #dobotArm.move_to_xyz(api, pick_x, pick_y, Z_SAFE, rHead): moves the robot to the specified (x, y, z) coordinates with a specified rotation for the end effector (rHead). Z_SAFE is a predefined constant that ensures the robot maintains a safe height to avoid collisions when moving horizontally.
 
-
-
 import dobotArm
 import lib.DobotDllType as dType
 import numpy as np
 import cv2
 import time
-
+import os  # <-- Moved here for clean importing
 
 """CONSTANTS"""
-
-Z_SAFE = 40 #what is the clearance distance for the robot arm to avoid collisions when moving horizontally?
-Z_PICK = -25 #what is the  height for the robot claw to successfully pick up the target?
-STABILITY_LIMIT = 60  #how many consecutive frames of stable detection before we "lock in" the positions and move to the next phase? (at 30fps, 60 frames is about 2 seconds)
-PIXEL_TOLERANCE = 10  #object can move at most this # of pixels to be considered stationary
+Z_SAFE = 40 
+Z_PICK = -25 
+STABILITY_LIMIT = 60  
+PIXEL_TOLERANCE = 10  
 
 machine_state = "scanning plate" 
+MOOD_FILE = "mood_output.txt"  # File path linked to your chatbot pipeline
 
 # --- INITIALIZATION FOR CAMERA TRANSFORMATION ---
-# MAKE SURE THAT YOU HAVE RAN calibrateCamera.py FIRST TO GENERATE THE camera_params.npz FILE
 api = dType.load()
 cap = cv2.VideoCapture(0)
 H_matrix = np.load("HomographyMatrix.npy")
@@ -44,6 +41,8 @@ dist_coeffs   = data["dist_coeffs"]
 
 # Compute undistort maps once
 ret, frame = cap.read()
+if not ret:
+    raise RuntimeError("Failed to read from camera during initialization")
 h, w = frame.shape[:2]
 new_K, roi = cv2.getOptimalNewCameraMatrix(camera_matrix, dist_coeffs, (w,h), 1)
 map1, map2 = cv2.initUndistortRectifyMap(camera_matrix, dist_coeffs, None, new_K, (w,h), cv2.CV_16SC2)
@@ -53,12 +52,6 @@ def pixel_to_robot(u, v, H):
     xy = H @ p
     xy /= xy[2]
     return xy[0], xy[1]
-
-
-# State machine logic to control the flow of the program through the three phases: scanning for plates, scanning for targets, and executing pick/place operations.
-# THIS STATE MACHINE IS TOO SIMPLE. Can you think of logics that should change the robot's sequnece of actions?
-# Ex: what if the robot fails to pick up a target? should it retry? should it go back to scanning for targets in case the target was moved? what if a new plate is added during the pick/place phase?
-# What if a human's hand is in sight during pick/place phase? (safety first!)
 
 def next_state():
     global machine_state
@@ -71,11 +64,72 @@ def next_state():
     else:
         machine_state = "scanning plate"
 
+# ---------------------------------------------------------
+# ROBOT EMOTION PERSONALITY MODIFIER
+# ---------------------------------------------------------
+def apply_emotion_personality(api, current_x, current_y, current_z, current_r=0):
+    """
+    Reads the latest mood from the text file and alters the Dobot's 
+    speed, acceleration, and performs custom pre-move expressions.
+    """
+    mood = "neutral"
+    if os.path.exists(MOOD_FILE):
+        try:
+            with open(MOOD_FILE, "r") as f:
+                mood = f.read().strip().lower()
+        except Exception as e:
+            print(f"Error reading mood file: {e}")
+            mood = "neutral"
+
+    print(f"Executing motion with Robot Personality profile: [{mood.upper()}]")
+
+    # Reset to standard baseline first
+    dType.SetPTPCommonParams(api, 50, 50, isQueued=1)
+
+    if mood == "happy":
+        print("Personality: Feeling joyful! Twirling...")
+        # Does a little twirl (rotates 185° on joint 1) before picking
+        dType.SetPTPCmd(api, dType.PTPMode.PTPJMoveMode, 185, current_y, current_z, current_r, isQueued=1)
+        dType.SetPTPCmd(api, dType.PTPMode.PTPJMoveMode, current_x, current_y, current_z, current_r, isQueued=1)
+        dType.dSleep(5000)
+
+    elif mood == "sad":
+        print("Personality: Feeling low. Moving slowly...")
+        # Drop speed drastically
+        dType.SetPTPCommonParams(api, 15, 10, isQueued=1)
+        # Move halfway down and pause mid-air
+        mid_hover_z = current_z + 20
+        dobotArm.move_to_xyz(api, current_x, current_y, mid_hover_z)
+        time.sleep(1.5)
+
+    elif mood == "angry":
+        print("Personality: FRUSTRATED! Snappy movements!")
+        # Max out speed profiles
+        dType.SetPTPCommonParams(api, 100, 100, isQueued=1)
+
+    elif mood == "tired":
+        print("Personality: Exhausted... nodding off.")
+        dType.SetPTPCommonParams(api, 20, 15, isQueued=1)
+        # Nodding sequence: droop slightly down and back up
+        dobotArm.move_to_xyz(api, current_x, current_y, current_z - 15)
+        dobotArm.move_to_xyz(api, current_x, current_y, current_z)
+        time.sleep(1.0)
+
+    elif mood == "surprised":
+        print("Personality: Startled!")
+        dType.SetPTPCommonParams(api, 90, 90, isQueued=1)
+        # Jump upward quickly
+        dobotArm.move_to_xyz(api, current_x, current_y, current_z + 40)
+        time.sleep(0.5)
+
+    else: # "neutral"
+        dType.SetPTPCommonParams(api, 50, 50, isQueued=1)
+
+    return mood
 
 
 # ---------------------------------------------------------
 # PHASE 1: DETECT Part Drop Zones (Plates)
-# this script assumes a metallic circular plate as the drop zone, but you can modify the detection logic to fit your specific use case.
 # ---------------------------------------------------------
 def phase_detect_plates():
     print("\n[PHASE 1] Scanning for drop zones. Waiting for stability...")
@@ -99,7 +153,6 @@ def phase_detect_plates():
                 rx, ry = pixel_to_robot(i[0], i[1], H_matrix)
                 current_list.append((rx, ry))
 
-        # --- AUTO-LOCK LOGIC ---
         if len(current_list) > 0 and len(current_list) == last_count:
             stability_counter += 1
         else:
@@ -115,12 +168,9 @@ def phase_detect_plates():
             print(f"Locked {len(current_list)} plates.")
             return current_list
   
- 
 
 # ---------------------------------------------------------
 # PHASE 2: DETECT Red velcros to pick up (Red Blocks)
-# this script assumes the targets to be picked up are red blocks
-# be aware your target maynot be red, and they may not be rectangular! You will need to modify the detection logic to fit your specific use case.
 # ---------------------------------------------------------
 def phase_detect_targets():
     print("\n[PHASE 2] Scanning for targets. Waiting for stability...")
@@ -132,10 +182,8 @@ def phase_detect_targets():
         if not ret: continue
         
         frame = cv2.remap(frame, map1, map2, cv2.INTER_LINEAR)
-        # Create a display copy so drawings don't affect next frame's HSV detection
         display_frame = frame.copy()
         
-        # Red Tag Logic
         hsv = cv2.cvtColor(cv2.GaussianBlur(frame, (3,3), 0), cv2.COLOR_BGR2HSV)
         mask = cv2.inRange(hsv, np.array([0,120,70]), np.array([10,255,255])) + \
                cv2.inRange(hsv, np.array([170,120,70]), np.array([180,255,255]))
@@ -150,12 +198,10 @@ def phase_detect_targets():
                     cx, cy = int(M["m10"] / M["m00"]), int(M["m01"] / M["m00"])
                     rx, ry = pixel_to_robot(cx, cy, H_matrix)
                     current_list.append((rx, ry))
-                    # Draw on display_frame only
                     cv2.drawContours(display_frame, [cnt], -1, (0, 255, 0), 2)
                     
         cv2.waitKey(1)
 
-        # --- STABILITY LOGIC ---
         if len(current_list) != 0:
             if len(current_list) > 0 and len(current_list) == last_count:
                 stability_counter += 1
@@ -163,7 +209,6 @@ def phase_detect_targets():
                 stability_counter = 0
                 last_count = len(current_list)
 
-        # Visual Feedback
         progress = int((stability_counter / STABILITY_LIMIT) * 100)
         color = (0, 255, 0) if progress < 100 else (255, 255, 0)
         
@@ -171,19 +216,13 @@ def phase_detect_targets():
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
         cv2.imshow("Detection", display_frame)
         
-        # --- EXIT CONDITION ---
         if stability_counter >= STABILITY_LIMIT:
             print(f"[SUCCESS] Locked {len(current_list)} targets.")
-            #cv2.waitKey(500) # Brief pause so you can see the 100%
-    
             return current_list
 
 
 # ---------------------------------------------------------
-# PHASE 3: PICK/PLACE LOOP
-# This function assumes 1 drop zone only has 1 part, and executes the pick/place operations in batches.
-# if you are picking up rigid car parts, would you still be able to move directly to the object and to the drop zone? 
-# Do you need collision avoidance? Think about if the robot gripper accidentally hits the plate or other parts on the way to the target, what would happen? How would you modify the robot's movement logic to avoid collisions?
+# PHASE 3: PICK/PLACE LOOP WITH INJECTED PERSONALITY
 # ---------------------------------------------------------
 def phase_execute_batch(api, pick_list, drop_list):
     cv2.VideoCapture(0)
@@ -193,7 +232,6 @@ def phase_execute_batch(api, pick_list, drop_list):
         print("missing targets, aborting")
         return False
     
-    # Match 1 part to 1 drop zone (uses the smaller count)
     batch_size = min(len(pick_list), len(drop_list))
     print(f"\n[PHASE 3] Executing batch of {batch_size} operations.")
 
@@ -203,68 +241,36 @@ def phase_execute_batch(api, pick_list, drop_list):
 
         print(f"Task {i+1}: Moving {pick_x, pick_y} to {drop_x, drop_y}")
 
+        # === INJECTED PERSONALITY CHECK HERE ===
+        # Pass the targets coordinates to configure physical parameters before moving
+        current_mood = apply_emotion_personality(api, pick_x, pick_y, Z_SAFE)
+
         # --- PICK SEQUENCE ---
         dobotArm.move_to_xyz(api, pick_x, pick_y, Z_SAFE)
         dobotArm.move_to_xyz(api, pick_x, pick_y, Z_PICK)
-        #optional alternate function call method to include a rotation of the gripper angle
-        #dobotArm.move_to_xyz(api, pick_x, pick_y, Z_SAFE, 45) 
 
-        dobotArm.close_gripper(api)
+        # Snappy / Aggressive gripper check for angry state
+        if current_mood == "angry":
+            dType.SetEndEffectorGripper(api, enableCtrl=1, on=1, isQueued=1)
+            time.sleep(0.1) # Snappy clamp action execution buffer
+        else:
+            dobotArm.close_gripper(api)
+            
         dobotArm.move_to_xyz(api, pick_x, pick_y, Z_SAFE)
 
         # --- PLACE SEQUENCE ---
+        # Reset back to default neutral pace for placement to ensure drops are uniform and clean
+        dType.SetPTPCommonParams(api, 50, 50, isQueued=1)
+
         dobotArm.move_to_xyz(api, drop_x, drop_y, Z_SAFE)
         dobotArm.open_gripper(api)
-        dobotArm.stop_pump(api)
-        dobotArm.move_to_xyz(api, drop_x, drop_y, Z_SAFE)
+        try:
+            dobotArm.stop_pump(api)
+        except Exception:
+            pass
 
-    # irl, it is ok for 1 dish to contain multiple parts
-    # if len(pick_list) > len(drop_list):
-    #     for i in range(len(pick_list)):
-    #         pick_x, pick_y = pick_list[i]
-    #         drop_x, drop_y = drop_list[0]
-    #         # --- PICK SEQUENCE ---
-    #         dobotArm.move_to_xyz(api, pick_x, pick_y, Z_SAFE)
-    #         dobotArm.move_to_xyz(api, pick_x, pick_y, Z_PICK)
-    #         dobotArm.close_gripper(api)
-    #         dobotArm.move_to_xyz(api, pick_x, pick_y, Z_SAFE)
-
-    #     # --- PLACE SEQUENCE ---
-    #         dobotArm.move_to_xyz(api, drop_x, drop_y, Z_SAFE)
-    #         dobotArm.open_gripper(api)
-    #         dobotArm.stop_pump(api)
-    #         dobotArm.move_to_xyz(api, drop_x, drop_y, Z_SAFE)
+        print(f"[TASK {i+1}] Completed")
 
     print("\nBatch Complete.")
     return True
- 
 
-# ---------------------------------------------------------
-# MAIN EXECUTION
-# contains an oversimplified state machine that runs the three phases sequentially. You can modify the logic to fit your specific use case.
-# ---------------------------------------------------------
-dobotArm.initialize_robot(api)
-dobotArm.open_gripper(api)
-dobotArm.stop_pump(api)
-
-while machine_state == "scanning plate":
-    drop_zone = phase_detect_plates()
-    if drop_zone is not None:
-        next_state()
-
-
-while machine_state == "scanning target":
-    pick_target = phase_detect_targets()
-    if pick_target is not None:
-        next_state()
-
-
-while machine_state == "pick place":
-    completed = phase_execute_batch(api, pick_target, drop_zone)
-    if completed:
-        next_state()
-    else: break
-
-
-cap.release()
-cv2.destroyAllWindows()
