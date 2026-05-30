@@ -20,7 +20,6 @@ import lib.DobotDllType as dType
 import numpy as np
 import cv2
 import time
-import os  # <-- Moved here for clean importing
 
 """CONSTANTS"""
 Z_SAFE = 40 
@@ -28,8 +27,7 @@ Z_PICK = -25
 STABILITY_LIMIT = 60  
 PIXEL_TOLERANCE = 10  
 
-machine_state = "scanning plate" 
-MOOD_FILE = "mood_output.txt"  # File path linked to your chatbot pipeline
+machine_state = "scanning plate"
 
 # --- INITIALIZATION FOR CAMERA TRANSFORMATION ---
 api = dType.load()
@@ -63,70 +61,6 @@ def next_state():
         machine_state = "scanning plate"
     else:
         machine_state = "scanning plate"
-
-# ---------------------------------------------------------
-# ROBOT EMOTION PERSONALITY MODIFIER
-# ---------------------------------------------------------
-def apply_emotion_personality(api, current_x, current_y, current_z, current_r=0):
-    """
-    Reads the latest mood from the text file and alters the Dobot's 
-    speed, acceleration, and performs custom pre-move expressions.
-    """
-    mood = "neutral"
-    if os.path.exists(MOOD_FILE):
-        try:
-            with open(MOOD_FILE, "r") as f:
-                mood = f.read().strip().lower()
-        except Exception as e:
-            print(f"Error reading mood file: {e}")
-            mood = "neutral"
-
-    print(f"Executing motion with Robot Personality profile: [{mood.upper()}]")
-
-    # Reset to standard baseline first
-    dType.SetPTPCommonParams(api, 50, 50, isQueued=1)
-
-    if mood == "happy":
-        print("Personality: Feeling joyful! Twirling...")
-        # Does a little twirl (rotates 185° on joint 1) before picking
-        dType.SetPTPCmd(api, dType.PTPMode.PTPJMoveMode, 185, current_y, current_z, current_r, isQueued=1)
-        dType.SetPTPCmd(api, dType.PTPMode.PTPJMoveMode, current_x, current_y, current_z, current_r, isQueued=1)
-        dType.dSleep(5000)
-
-    elif mood == "sad":
-        print("Personality: Feeling low. Moving slowly...")
-        # Drop speed drastically
-        dType.SetPTPCommonParams(api, 15, 10, isQueued=1)
-        # Move halfway down and pause mid-air
-        mid_hover_z = current_z + 20
-        dobotArm.move_to_xyz(api, current_x, current_y, mid_hover_z)
-        time.sleep(1.5)
-
-    elif mood == "angry":
-        print("Personality: FRUSTRATED! Snappy movements!")
-        # Max out speed profiles
-        dType.SetPTPCommonParams(api, 100, 100, isQueued=1)
-
-    elif mood == "tired":
-        print("Personality: Exhausted... nodding off.")
-        dType.SetPTPCommonParams(api, 20, 15, isQueued=1)
-        # Nodding sequence: droop slightly down and back up
-        dobotArm.move_to_xyz(api, current_x, current_y, current_z - 15)
-        dobotArm.move_to_xyz(api, current_x, current_y, current_z)
-        time.sleep(1.0)
-
-    elif mood == "surprised":
-        print("Personality: Startled!")
-        dType.SetPTPCommonParams(api, 90, 90, isQueued=1)
-        # Jump upward quickly
-        dobotArm.move_to_xyz(api, current_x, current_y, current_z + 40)
-        time.sleep(0.5)
-
-    else: # "neutral"
-        dType.SetPTPCommonParams(api, 50, 50, isQueued=1)
-
-    return mood
-
 
 # ---------------------------------------------------------
 # PHASE 1: DETECT Part Drop Zones (Plates)
@@ -222,16 +156,16 @@ def phase_detect_targets():
 
 
 # ---------------------------------------------------------
-# PHASE 3: PICK/PLACE LOOP WITH INJECTED PERSONALITY
+# PHASE 3: PICK/PLACE LOOP
 # ---------------------------------------------------------
 def phase_execute_batch(api, pick_list, drop_list):
     cv2.VideoCapture(0)
     time.sleep(0.5)
-    
+
     if len(pick_list) == 0 or len(drop_list) == 0:
         print("missing targets, aborting")
         return False
-    
+
     batch_size = min(len(pick_list), len(drop_list))
     print(f"\n[PHASE 3] Executing batch of {batch_size} operations.")
 
@@ -241,27 +175,13 @@ def phase_execute_batch(api, pick_list, drop_list):
 
         print(f"Task {i+1}: Moving {pick_x, pick_y} to {drop_x, drop_y}")
 
-        # === INJECTED PERSONALITY CHECK HERE ===
-        # Pass the targets coordinates to configure physical parameters before moving
-        current_mood = apply_emotion_personality(api, pick_x, pick_y, Z_SAFE)
-
         # --- PICK SEQUENCE ---
         dobotArm.move_to_xyz(api, pick_x, pick_y, Z_SAFE)
         dobotArm.move_to_xyz(api, pick_x, pick_y, Z_PICK)
-
-        # Snappy / Aggressive gripper check for angry state
-        if current_mood == "angry":
-            dType.SetEndEffectorGripper(api, enableCtrl=1, on=1, isQueued=1)
-            time.sleep(0.1) # Snappy clamp action execution buffer
-        else:
-            dobotArm.close_gripper(api)
-            
+        dobotArm.close_gripper(api)
         dobotArm.move_to_xyz(api, pick_x, pick_y, Z_SAFE)
 
         # --- PLACE SEQUENCE ---
-        # Reset back to default neutral pace for placement to ensure drops are uniform and clean
-        dType.SetPTPCommonParams(api, 50, 50, isQueued=1)
-
         dobotArm.move_to_xyz(api, drop_x, drop_y, Z_SAFE)
         dobotArm.open_gripper(api)
         try:

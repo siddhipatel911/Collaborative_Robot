@@ -1,59 +1,84 @@
 """
-test_pick.py — Standalone test: detect a coloured block and move the robot to it.
-
-Opens the camera, shows the feed with the placement zone overlay, waits for a
-block to appear and stabilise, prints its pixel and robot coordinates, then moves
-the Dobot arm to that position at safe height.
-
-Press Q to quit at any time.
+test_pick.py — Auto pick blocks detected near the arm.
 """
 
 import dobotArm
 import lib.DobotDllType as dType
-import numpy as np
 import cv2
-import time
+import numpy as np
 
-# ── Config ──
 Z_SAFE = 40
-
-PZ_X1, PZ_Y1 = 50, 20
-PZ_X2, PZ_Y2 = 650, 315
-
-HOLD_FRAMES = 8        # consecutive frames a block must be visible before we act
+Z_PICK = -25
+DROP_X, DROP_Y = 200, 3000
+HOLD_FRAMES = 8
+MISS_LIMIT = 5
+MIN_CONTOUR_AREA = 400
 PICK_PROXIMITY_PX = 30
+MAX_PICKS = 3
+
+# Only pick blocks within this pixel zone around center
+PICK_ZONE_RADIUS = 50
 
 COLOUR_HSV = {
-    "red":   ([(0, 120, 70), (10, 255, 255)], [(170, 120, 70), (180, 255, 255)]),
-    "green": ([(40, 80, 70), (80, 255, 255)],),
-    "blue":  ([(90, 80, 70), (130, 255, 255)],),
+    "purple": ([(125, 50, 50), (155, 255, 255)],),
 }
 
 COLOUR_BGR = {
-    "red":   (0, 0, 255),
-    "green": (0, 255, 0),
-    "blue":  (255, 0, 0),
+    "purple": (255, 0, 255),
 }
+
+# ── Camera setup ──
+cap = cv2.VideoCapture(1, cv2.CAP_DSHOW)
+if not cap.isOpened():
+    cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
+if not cap.isOpened():
+    print("[FATAL] No camera found")
+    exit(1)
+
+cv2.namedWindow("Camera", cv2.WINDOW_NORMAL)
+
+# ── Load calibration for undistortion (helps detection) ──
+try:
+    data = np.load("camera_params.npz")
+    camera_matrix, dist_coeffs = data["camera_matrix"], data["dist_coeffs"]
+    ret, frame = cap.read()
+    h, w = frame.shape[:2]
+    new_K, _ = cv2.getOptimalNewCameraMatrix(camera_matrix, dist_coeffs, (w, h), 1)
+    map1, map2 = cv2.initUndistortRectifyMap(camera_matrix, dist_coeffs, None, new_K, (w, h), cv2.CV_16SC2)
+    use_undistort = True
+except FileNotFoundError:
+    print("[WARN] No camera calibration — using raw feed.")
+    use_undistort = False
+
+# ── Robot setup ──
+api = dType.load()
+
+print("[ROBOT] Connecting and homing...")
+dobotArm.initialize_robot(api)
+
+CENTER_X, CENTER_Y = 180, 0
+print(f"[ROBOT] Moving to center ({CENTER_X}, {CENTER_Y}, {Z_SAFE})...")
+dobotArm.move_to_xyz(api, CENTER_X, CENTER_Y, Z_SAFE)
+print("\n[READY] Place a block under the arm. It will auto-pick.")
+print("       Press Q to quit.\n")
 
 # ── Helpers ──
 
-def pixel_to_robot(u, v, H):
-    p = np.array([u, v, 1])
-    xy = H @ p
-    xy /= xy[2]
-    return xy[0], xy[1]
-
-def detect_coloured_blocks(frame):
+def detect_blocks(frame):
+    if use_undistort:
+        frame = cv2.remap(frame, map1, map2, cv2.INTER_LINEAR)
     hsv = cv2.cvtColor(cv2.GaussianBlur(frame, (3, 3), 0), cv2.COLOR_BGR2HSV)
     blocks = []
     for colour, ranges in COLOUR_HSV.items():
-        mask = cv2.inRange(hsv, np.array(ranges[0][0]), np.array(ranges[0][1]))
-        if len(ranges) > 1:
-            mask += cv2.inRange(hsv, np.array(ranges[1][0]), np.array(ranges[1][1]))
+        mask = np.zeros(frame.shape[:2], dtype=np.uint8)
+        for r in ranges:
+            lower = np.array(r[0], dtype=np.uint8)
+            upper = np.array(r[1], dtype=np.uint8)
+            mask = cv2.bitwise_or(mask, cv2.inRange(hsv, lower, upper))
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         for c in contours:
-            if cv2.contourArea(c) > 400:
+            if cv2.contourArea(c) > MIN_CONTOUR_AREA:
                 M = cv2.moments(c)
                 if M["m00"]:
                     cx, cy = int(M["m10"] / M["m00"]), int(M["m01"] / M["m00"])
@@ -67,142 +92,96 @@ def matches(block, block_list):
             return True
     return False
 
-# ── Camera setup (before robot init so window appears immediately) ──
-api = dType.load()
-cap = cv2.VideoCapture(1, cv2.CAP_DSHOW)
-if not cap.isOpened():
-    print("[WARN] Camera index 1 failed, trying index 0...")
-    cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
-if not cap.isOpened():
-    print("[FATAL] No camera found")
-    exit(1)
-print("[CAMERA] Opened")
-
-try:
-    H_matrix = np.load("HomographyMatrix.npy")
-    data = np.load("camera_params.npz")
-    camera_matrix, dist_coeffs = data["camera_matrix"], data["dist_coeffs"]
-except FileNotFoundError as e:
-    print(f"[FATAL] Missing calibration file: {e}")
-    print("       Run calibrateCamera.py and getTransformationMatrix.py first.")
-    exit(1)
-
-ret, frame = cap.read()
-if not ret:
-    print("[FATAL] Cannot read from camera")
-    exit(1)
-
-h, w = frame.shape[:2]
-new_K, _ = cv2.getOptimalNewCameraMatrix(camera_matrix, dist_coeffs, (w, h), 1)
-map1, map2 = cv2.initUndistortRectifyMap(
-    camera_matrix, dist_coeffs, None, new_K, (w, h), cv2.CV_16SC2
-)
-
-# Show camera window immediately (before robot's blocking homing)
-cv2.namedWindow("Test Pick", cv2.WINDOW_NORMAL)
-cv2.setWindowProperty("Test Pick", cv2.WND_PROP_TOPMOST, 1)
-frame_show = cv2.remap(frame, map1, map2, cv2.INTER_LINEAR)
-cv2.imshow("Test Pick", frame_show)
-cv2.waitKey(1)
-
-# ── Robot setup ──
-print("[ROBOT] Connecting and homing...")
-dobotArm.initialize_robot(api)
-print("[ROBOT] Homing done, opening gripper...")
-dobotArm.open_gripper(api)
-dobotArm.set_speed(api, 50)
-
-# Move to a safe neutral position so the arm is out of the camera's way
-print("[ROBOT] Moving to ready position (180, 0, 40)...")
-dobotArm.move_to_xyz(api, 180, 0, Z_SAFE)
-print("\n[READY] Place a coloured block in the green zone.")
-print("        The robot will move to its location.")
-print("        Press Q to quit.\n")
-
 # ── Main loop ──
 active_block = None
 hold_count = 0
+miss_count = 0
+pick_count = 0
 
 while True:
     ret, frame = cap.read()
     if not ret:
         continue
 
-    frame = cv2.remap(frame, map1, map2, cv2.INTER_LINEAR)
-    display = frame.copy()
+    if use_undistort:
+        display = cv2.remap(frame, map1, map2, cv2.INTER_LINEAR)
+    else:
+        display = frame.copy()
 
-    blocks = detect_coloured_blocks(frame)
-    zone_blocks = [(x, y, c) for x, y, c in blocks
-                   if PZ_X1 <= x <= PZ_X2 and PZ_Y1 <= y <= PZ_Y2]
+    blocks = detect_blocks(frame)
 
-    # ── Draw placement zone ──
-    cv2.rectangle(display, (PZ_X1, PZ_Y1), (PZ_X2, PZ_Y2), (0, 255, 0), 2)
-    cv2.putText(display, "PLACEMENT ZONE", (PZ_X1, PZ_Y1 - 10),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+    # Only consider blocks near center of frame
+    cx, cy = display.shape[1] // 2, display.shape[0] // 2
+    near_blocks = [(x, y, c) for x, y, c in blocks
+                   if abs(x - cx) < PICK_ZONE_RADIUS and abs(y - cy) < PICK_ZONE_RADIUS]
 
-    # ── Draw detected blocks ──
-    for bx, by, bc in zone_blocks:
+    # Draw pick zone
+    cv2.rectangle(display, (cx - PICK_ZONE_RADIUS, cy - PICK_ZONE_RADIUS),
+                  (cx + PICK_ZONE_RADIUS, cy + PICK_ZONE_RADIUS), (0, 255, 255), 2)
+    cv2.putText(display, "PICK ZONE", (cx - PICK_ZONE_RADIUS, cy - PICK_ZONE_RADIUS - 10),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
+
+    for bx, by, bc in near_blocks:
         cv2.circle(display, (bx, by), 8, COLOUR_BGR[bc], -1)
         cv2.circle(display, (bx, by), 8, (255, 255, 255), 1)
-        # Show pixel coordinates next to each block
-        cv2.putText(display, f"({bx}, {by})", (bx + 12, by + 4),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
 
-    cv2.putText(display, f"Blocks in zone: {len(zone_blocks)}",
-                (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+    cv2.putText(display, f"Blocks: {len(near_blocks)}", (10, 30),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+    cv2.imshow("Camera", display)
 
-    # ── Key input ──
     key = cv2.waitKey(1) & 0xFF
     if key == ord('q'):
         break
 
-    # ── Debounce: wait for a block to be stable for HOLD_FRAMES ──
-    if not zone_blocks:
-        active_block = None
-        hold_count = 0
-        cv2.imshow("Test Pick", display)
+    # ── Debounce ──
+    if not near_blocks:
+        miss_count += 1
+        if miss_count >= MISS_LIMIT:
+            active_block = None
+            hold_count = 0
         continue
+    else:
+        miss_count = 0
 
     if active_block is None:
-        active_block = zone_blocks[0]
+        active_block = near_blocks[0]
         hold_count = 0
-    elif not matches(active_block, zone_blocks):
-        active_block = zone_blocks[0]
+    elif not matches(active_block, near_blocks):
+        active_block = near_blocks[0]
         hold_count = 0
-        cv2.imshow("Test Pick", display)
         continue
 
     hold_count += 1
 
     if hold_count >= HOLD_FRAMES:
-        px, py, colour = active_block
-        rx, ry = pixel_to_robot(px, py, H_matrix)
+        print(f"[PICK] Block detected. Picking at current position...")
 
-        print(f"[DETECTED] {colour.upper()} block")
-        print(f"  Pixel  : ({px}, {py})")
-        print(f"  Robot  : ({rx:.1f}, {ry:.1f}) mm")
-        print(f"  Moving robot to ({rx:.1f}, {ry:.1f}, Z={Z_SAFE})...")
+        # --- PICK (straight down at current arm position) ---
+        dobotArm.move_to_xyz(api, CENTER_X, CENTER_Y, Z_PICK)
+        dobotArm.close_gripper(api)
+        dobotArm.move_to_xyz(api, CENTER_X, CENTER_Y, Z_SAFE)
 
-        # Add text to the frame before moving (so user sees the coordinate overlay)
-        cv2.putText(display, f"TARGET: ({rx:.1f}, {ry:.1f}) mm",
-                    (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
-        cv2.imshow("Test Pick", display)
-        cv2.waitKey(1)
+        # --- PLACE ---
+        dobotArm.move_to_xyz(api, DROP_X, DROP_Y, Z_SAFE)
+        dobotArm.move_to_xyz(api, DROP_X, DROP_Y, Z_PICK)
+        dobotArm.open_gripper(api)
+        dobotArm.move_to_xyz(api, DROP_X, DROP_Y, Z_SAFE)
 
-        # Move the robot to the block's position (blocking call — feed freezes)
-        dobotArm.move_to_xyz(api, rx, ry, Z_SAFE)
+        pick_count += 1
+        print(f"[{pick_count}/{MAX_PICKS}] Done. Back to center...")
+        dobotArm.move_to_xyz(api, CENTER_X, CENTER_Y, Z_SAFE)
 
-        print(f"  Arrived at ({rx:.1f}, {ry:.1f}, {Z_SAFE}). Place another block or press Q.\n")
+        if pick_count >= MAX_PICKS:
+            print(f"[DONE] All {MAX_PICKS} blocks picked and placed.")
+            break
 
-        # Reset so we can detect the next block
         active_block = None
         hold_count = 0
+        miss_count = 0
         continue
-
-    cv2.imshow("Test Pick", display)
 
 # ── Cleanup ──
 cap.release()
 cv2.destroyAllWindows()
 dobotArm.move_to_home(api)
-print("[DONE] Test ended.")
+print("Finished.")

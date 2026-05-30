@@ -92,8 +92,9 @@ COLOUR_BGR = {
 # -- Placement zone (pixel coordinates on the camera image) --
 # The green rectangle drawn on-screen. Only blocks whose centroid falls
 # inside this rectangle are considered for picking.
-PZ_X1, PZ_Y1 = 150, 150   # top-left corner
-PZ_X2, PZ_Y2 = 500, 500   # bottom-right corner
+
+PZ_X1, PZ_Y1 = 50, 20     # top-left corner
+PZ_X2, PZ_Y2 = 650, 315   # bottom-right corner
 WINDOW_NAME = "Collaborative Robot Demo"
 
 # -- Speed adaptation --

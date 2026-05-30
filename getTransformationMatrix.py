@@ -12,14 +12,17 @@ CON_STR = {
     dType.DobotConnect.DobotConnect_Occupied: "DobotConnect_Occupied"
 }
 
-cam = cv2.VideoCapture(0)
+cam = cv2.VideoCapture(1, cv2.CAP_DSHOW)
+if not cam.isOpened():
+    print("[WARN] Camera index 1 failed, trying index 0...")
+    cam = cv2.VideoCapture(0, cv2.CAP_DSHOW)
 
 if not cam.isOpened():
     print("Camera failed to open")
     exit()
     
 #if the program errors for file path problems, copy the relative path to camera_params.npz and paste it here and try again. 
-data = np.load("Collaborative_Robotics\camera_params.npz")
+data = np.load("camera_params.npz")
 camera_matrix = data["camera_matrix"]
 dist_coeffs   = data["dist_coeffs"]
 
