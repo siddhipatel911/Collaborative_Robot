@@ -113,10 +113,10 @@ def main():
         safety.close()
         return
 
-    # Live camera mode
-    cap = cv2.VideoCapture(0)
+    # Live camera mode — external USB camera (index 1) first, fallback to laptop
+    cap = cv2.VideoCapture(1, cv2.CAP_DSHOW)
     if not cap.isOpened():
-        cap = cv2.VideoCapture(1)
+        cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
     if not cap.isOpened():
         print("No camera found")
         sys.exit(1)

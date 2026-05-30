@@ -5,17 +5,26 @@ import os
 import sys
 import time
 
-# Prefer the camera index used in calibrateCamera.py (external camera)
-PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
-if PROJECT_ROOT not in sys.path:
-    sys.path.insert(0, PROJECT_ROOT)
-try:
-    import calibrateCamera
-    CAMERA_INDEX = getattr(calibrateCamera, 'CAMERA_INDEX', 0)
-except Exception:
-    CAMERA_INDEX = 0
-
 app = Flask(__name__, static_folder='.', template_folder='.')
+
+
+def find_camera(max_index=4):
+    """Auto-detect cameras, prefer index 1 (external USB)."""
+    available = []
+    for i in range(max_index):
+        cap = cv2.VideoCapture(i, cv2.CAP_DSHOW)
+        if cap.isOpened():
+            ret, frame = cap.read()
+            if ret and frame is not None:
+                available.append(i)
+        cap.release()
+    cam_idx = 1 if 1 in available else (available[0] if available else None)
+    if cam_idx is None:
+        print('[STREAM] No camera found')
+        return None
+    print(f'[STREAM] Cameras: {available}  Using: {cam_idx}')
+    return cv2.VideoCapture(cam_idx, cv2.CAP_DSHOW)
+
 
 @app.route('/')
 def index():
@@ -25,15 +34,11 @@ def index():
 def styles():
     return send_from_directory('.', 'styles.css')
 
-def mjpeg_generator(device=None):
-    # default to external camera index from calibrateCamera.py
-    if device is None:
-        device = CAMERA_INDEX
+def mjpeg_generator():
     ui_latest = os.path.join(os.path.dirname(__file__), 'latest.jpg')
-    cap = cv2.VideoCapture(device)
+    cap = find_camera()
     try:
         while True:
-            # If collaborative_demo is writing latest.jpg, serve that image repeatedly
             if os.path.exists(ui_latest):
                 try:
                     with open(ui_latest, 'rb') as f:
@@ -45,10 +50,9 @@ def mjpeg_generator(device=None):
                 except Exception:
                     pass
 
-            # Fallback to live camera capture
-            if not cap.isOpened():
-                cap.open(device)
-                if not cap.isOpened():
+            if cap is None or not cap.isOpened():
+                cap = find_camera()
+                if cap is None:
                     print('[STREAM] Camera not available')
                     time.sleep(0.5)
                     continue
@@ -64,7 +68,7 @@ def mjpeg_generator(device=None):
             yield (b'--frame\r\n'
                    b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
     finally:
-        if cap.isOpened():
+        if cap is not None and cap.isOpened():
             cap.release()
 
 @app.route('/stream')
@@ -72,5 +76,4 @@ def stream():
     return Response(mjpeg_generator(), mimetype='multipart/x-mixed-replace; boundary=frame')
 
 if __name__ == '__main__':
-    # Run on localhost:5000
     app.run(host='0.0.0.0', port=5000, threaded=True)

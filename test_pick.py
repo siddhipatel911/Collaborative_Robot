@@ -20,11 +20,11 @@ MAX_PICKS = 3
 PICK_ZONE_RADIUS = 50
 
 COLOUR_HSV = {
-    "purple": ([(125, 50, 50), (155, 255, 255)],),
+    "green": ([(35, 90, 80), (75, 255, 255)],),
 }
 
 COLOUR_BGR = {
-    "purple": (255, 0, 255),
+    "green": (0, 255, 0),
 }
 
 # ── Camera setup ──
