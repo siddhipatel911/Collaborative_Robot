@@ -1,4 +1,6 @@
 import lib.DobotDllType as dType
+import math
+import time
 
 #Useful global variables
 # --- These are status strings that you might see, so we're defining them here ---
@@ -29,7 +31,7 @@ def initialize_robot(api):
         exit()
     
     #we've found it, so let's try to connect
-    state = dType.ConnectDobot(api, "COM7", 115200)[0]
+    state = dType.ConnectDobot(api, "COM6", 115200)[0]
     
     #If the connection failed at this point, we also can't proceed, so we need to exit
     if state != dType.DobotConnect.DobotConnect_NoError:
@@ -76,14 +78,16 @@ def initialize_robot(api):
     #OK, the robot is ready to move!
     
 """
-    CHANGE: Switched from using Cartesian Linear to a Joint Space PTP mode
+    PTP MOVE: uses isQueued=0 (immediate mode) which is SYNCHRONOUS on this
+    Dobot — the DLL blocks until the physical movement finishes.
+    A safety sleep is added as fallback.
+    Non-blocking variant (wait=False) sends and returns; caller must time the wait.
 """
-def move_to_xyz(api,x,y,z,rHead=0):
-    cmdIndx = -1
-    execCmd = dType.SetPTPCmd(api,dType.PTPMode.PTPMOVJXYZMode,x,y,z,rHead,isQueued=0)[0]
-    #Allow the command to complete. The robot will stop moving when it's done
-    while execCmd > dType.GetQueuedCmdCurrentIndex(api)[0]:
-        dType.dSleep(25)
+def move_to_xyz(api, x, y, z, rHead=0, wait=True):
+    dType.SetPTPCmd(api, dType.PTPMode.PTPMOVJXYZMode, x, y, z, rHead, isQueued=0)
+    if wait:
+        dType.dSleep(3000)  # 3s safety wait for move completion
+    return 0
 
 """
     Move the robot to the given joint angles using PTP Linear ANGLE mode
@@ -106,14 +110,14 @@ def move_to_home(api):
     move_to_xyz(api,home_pos[0],home_pos[1],home_pos[2])
     
     
-def rotate_end_effector(api,angle):
-    if angle <= 90 and angle >= -90:
+def rotate_end_effector(api, angle, wait=True):
+    if 90 >= angle >= -90:
         pose = dType.GetPose(api)
-        cmdIndx = -1
-        execCmd = dType.SetPTPCmd(api,dType.PTPMode.PTPMOVLXYZMode,pose[0],pose[1],pose[2],angle,isQueued=0)[0]
-        #Allow the command to complete. The robot will stop moving when it's done
-        while execCmd > dType.GetQueuedCmdCurrentIndex(api)[0]:
-            dType.dSleep(25)
+        dType.SetPTPCmd(api, dType.PTPMode.PTPMOVLXYZMode, pose[0], pose[1], pose[2], angle, isQueued=0)
+        if wait:
+            dType.dSleep(3000)
+        return 0
+    return -1
         
 def open_gripper(api):
     #arguments are: api, enable control = 1, grip = 0 ("release"), isQueued = 0
@@ -129,6 +133,13 @@ def close_gripper(api):
     #is done opening
     dType.dSleep(500)
     
+def set_speed(api, velocity_pct, acceleration_pct=None):
+    if acceleration_pct is None:
+        acceleration_pct = velocity_pct
+    velocity_pct = max(1, min(100, velocity_pct))
+    acceleration_pct = max(1, min(100, acceleration_pct))
+    dType.SetPTPCommonParams(api, velocity_pct, acceleration_pct, isQueued=0)
+
 def stop_pump(api):
     #Yeah, I know it says suction cup. it's actually controlling the pneumatic pump
     dType.SetEndEffectorSuctionCup(api,1,0,0)[0]
