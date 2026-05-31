@@ -21,7 +21,7 @@
     </div>
 
     <div class="mood-panel">
-      <div id="moodBadge" class="mood-badge">mood: unknown</div>
+      <div id="moodBadge" class="mood-badge" title="mood: unknown"><span id="moodEmoji" class="mood-emoji">😐</span></div>
       <a href="/mood.log" target="_blank" class="mood-log">View mood log</a>
     </div>
 
@@ -83,6 +83,39 @@
     }
 
     tryMjpegThenGetUserMedia();
+
+    // Poll server for mood and show a small emoji (smoji) instead of text
+    (function pollMood(){
+      const emojiMap = {
+        "neutral": "😐",
+        "happy":   "😄",
+        "sad":     "😢",
+        "angry":   "😠",
+        "tired":   "😴",
+        "agitated":"😤",
+        "focused": "🤓",
+        "no_face": "👤",
+        "unknown": "❓"
+      };
+      const badge = document.getElementById('moodBadge');
+      const emoji = document.getElementById('moodEmoji');
+      async function updateOnce(){
+        try{
+          const res = await fetch('/mood.json', {cache: 'no-store'});
+          if(!res.ok) throw new Error('no mood');
+          const data = await res.json();
+          const m = (data && data.mood) ? data.mood : 'unknown';
+          const glyph = emojiMap[m] || emojiMap['unknown'];
+          if(emoji) emoji.textContent = glyph;
+          if(badge) badge.title = `mood: ${m}`;
+        }catch(e){
+          if(emoji) emoji.textContent = emojiMap['unknown'];
+          if(badge) badge.title = `mood: unknown`;
+        }
+      }
+      updateOnce();
+      setInterval(updateOnce, 1000);
+    })();
   </script>
 </body>
 </html>
