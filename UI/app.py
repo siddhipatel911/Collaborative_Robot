@@ -1,6 +1,17 @@
 from flask import Flask, Response, send_from_directory
 import os
 import time
+import platform
+from flask import request, jsonify
+
+# Optional robot control trigger
+try:
+    import mood_movement
+    import dobotArm as _dobot_arm
+    DOBOT_AVAILABLE = hasattr(_dobot_arm, 'api') and _dobot_arm.api is not None
+except Exception:
+    mood_movement = None
+    DOBOT_AVAILABLE = False
 
 app = Flask(__name__, static_folder='.', template_folder='.')
 
@@ -112,6 +123,19 @@ def assets(filename):
         return send_from_directory(assets_dir, filename)
     return Response('Not found', status=404)
 
+
+@app.route('/trigger_mood', methods=['POST'])
+def trigger_mood():
+    body = request.get_json(silent=True) or {}
+    mood = body.get('mood') or body.get('emotion') or 'neutral'
+    if mood_movement is None:
+        return jsonify({'ok': False, 'error': 'mood movement module not available'}), 503
+    try:
+        api = getattr(_dobot_arm, 'api', None)
+        mood_movement.perform_mood_movement(api, mood)
+        return jsonify({'ok': True, 'mood': mood})
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)}), 500
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000, threaded=True)

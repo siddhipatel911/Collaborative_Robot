@@ -8,7 +8,10 @@
 }
 html,body{height:100%;margin:0;font-family:Inter,system-ui,-apple-system,Segoe UI,Roboto,"Helvetica Neue",Arial;color:var(--text);background:var(--bg-color)}
 .bg{
-  position:fixed;inset:0;background-image: url('/assets/IMG_6706.jpeg');background-size:cover;background-position:center;filter:brightness(0.5);z-index:0;
+  position:fixed;inset:0;
+  /* Try absolute path first (Flask assets route), then workspace-relative fallbacks */
+  background-image: url('/assets/IMG_6706.jpeg'), url('assets/IMG_6706.jpeg'), url('../assets/IMG_6706.jpeg');
+  background-size:cover;background-position:center;filter:brightness(0.5);z-index:0;
 }
 .site-header{position:relative;z-index:2;padding:28px 24px 8px 24px;text-align:center}
 .site-header h1{margin:0;font-size:28px;letter-spacing:0.4px}
@@ -24,6 +27,12 @@ html,body{height:100%;margin:0;font-family:Inter,system-ui,-apple-system,Segoe U
 .mood-panel{position:relative;z-index:2;display:flex;align-items:center;gap:12px;margin-top:12px}
 .mood-badge{background:rgba(255,255,255,0.06);padding:8px 12px;border-radius:8px;font-weight:700}
 .mood-log{color:rgba(230,238,246,0.9);font-size:14px;text-decoration:underline}
+.mood-emoji{font-size:20px;display:inline-block;line-height:1}
+.mood-btn{background:var(--accent);color:#fff;border:0;padding:8px 12px;border-radius:6px;cursor:pointer}
+.mood-btn:hover{opacity:0.95}
+.mood-emoji{font-size:20px;display:inline-block;line-height:1}
+.mood-btn{background:var(--accent);color:#fff;border:0;padding:8px 12px;border-radius:6px;cursor:pointer}
+.mood-btn:hover{opacity:0.95}
 @media (max-width:640px){
   .camera-card{height:320px}
 }
