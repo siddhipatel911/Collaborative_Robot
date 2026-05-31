@@ -44,6 +44,7 @@ import dobotArm                   # our Dobot control functions
 import lib.DobotDllType as dType  # low-level Dobot DLL wrapper (for dType.load())
 import numpy as np
 import cv2
+import platform
 import time
 from collections import deque
 import os
@@ -115,6 +116,49 @@ HOLD_FRAMES = 8
 PICK_PROXIMITY_PX = 30  # blocks within this many pixels are considered the same
 PICK_RETRY_COUNT = 2
 PICK_RAISE_CHECK = -15  # raise to this Z to perform a quick pickup check
+
+# Emotion profiles (adjust robot behaviour)
+EMOTIONS = {
+    "neutral": {"speed": 1.0, "acceleration": 1.0, "pause_time": 0, "grip_force": "normal", "pre_animation": None, "post_animation": None},
+    "happy":   {"speed": 1.2, "acceleration": 1.1, "pause_time": 0, "grip_force": "normal", "pre_animation": "twirl", "post_animation": "bounce"},
+    "sad":     {"speed": 0.5, "acceleration": 0.5, "pause_time": 2, "grip_force": "gentle", "pre_animation": "droop", "post_animation": None},
+    "angry":   {"speed": 1.5, "acceleration": 1.8, "pause_time": 0.2, "grip_force": "hard", "pre_animation": None, "post_animation": "snap"},
+    "tired":   {"speed": 0.4, "acceleration": 0.4, "pause_time": 1.5, "grip_force": "weak", "pre_animation": "nod_off", "post_animation": None},
+}
+
+def perform_animation(api, name):
+    try:
+        if not name:
+            return
+        if name == "twirl":
+            dobotArm.rotate_end_effector(api, 45)
+            time.sleep(0.25)
+            dobotArm.rotate_end_effector(api, -45)
+            time.sleep(0.2)
+            dobotArm.rotate_end_effector(api, 0)
+        elif name == "bounce":
+            pose = dType.GetPose(api)
+            dobotArm.move_to_xyz(api, pose[0], pose[1], pose[2] + 20)
+            time.sleep(0.15)
+            dobotArm.move_to_xyz(api, pose[0], pose[1], pose[2])
+        elif name == "droop":
+            pose = dType.GetPose(api)
+            dobotArm.move_to_xyz(api, pose[0], pose[1], max(pose[2] - 15, -100))
+            time.sleep(0.6)
+            dobotArm.move_to_xyz(api, pose[0], pose[1], pose[2])
+        elif name == "snap":
+            dobotArm.rotate_end_effector(api, 30)
+            time.sleep(0.08)
+            dobotArm.rotate_end_effector(api, -30)
+            time.sleep(0.08)
+            dobotArm.rotate_end_effector(api, 0)
+        elif name == "nod_off":
+            pose = dType.GetPose(api)
+            dobotArm.move_to_xyz(api, pose[0], pose[1], pose[2] - 10)
+            time.sleep(0.6)
+            dobotArm.move_to_xyz(api, pose[0], pose[1], pose[2])
+    except Exception:
+        pass
 MIN_BLOCK_AREA = 400
 MIN_DROP_ZONE_AREA = 1200
 TEMPLATE_SCAN_INTERVAL = 0.4
@@ -315,21 +359,38 @@ class MoodAnalyzer:
 # Then load the pre-computed calibration files and build the undistortion map.
 
 def find_camera(max_index=6, preferred_index=1):
-    """Find a readable camera, matching calibrateCamera.py's preview behavior."""
+    """Find a readable camera, matching calibrateCamera.py's preview behavior.
+
+    On Windows we prefer the CAP_DSHOW backend for stability; on other
+    platforms we open without specifying a backend so OpenCV chooses the
+    appropriate one (AVFoundation on macOS, v4l2 on Linux).
+    """
     available = []
+    use_dshow = platform.system() == "Windows" and hasattr(cv2, 'CAP_DSHOW')
+
     for idx in range(max_index):
-        test_cap = cv2.VideoCapture(idx, cv2.CAP_DSHOW)
-        if test_cap.isOpened():
-            ret, test_frame = test_cap.read()
-            if ret and test_frame is not None:
-                available.append(idx)
-        test_cap.release()
+        try:
+            test_cap = cv2.VideoCapture(idx, cv2.CAP_DSHOW) if use_dshow else cv2.VideoCapture(idx)
+            if test_cap is None:
+                continue
+            if test_cap.isOpened():
+                ret, test_frame = test_cap.read()
+                if ret and test_frame is not None:
+                    available.append(idx)
+            test_cap.release()
+        except Exception:
+            # Ignore individual device probe failures
+            try:
+                test_cap.release()
+            except Exception:
+                pass
 
     if not available:
         return None, None
 
     selected = preferred_index if preferred_index in available else available[0]
-    return cv2.VideoCapture(selected, cv2.CAP_DSHOW), selected
+    cap = cv2.VideoCapture(selected, cv2.CAP_DSHOW) if use_dshow else cv2.VideoCapture(selected)
+    return cap, selected
 
 api = dType.load()                                              # load Dobot DLL first
 cap, CAMERA_INDEX = find_camera()
@@ -898,6 +959,11 @@ def main():
     last_cycle_time = 0                                   # timestamp of last completed pick cycle
     drop_zones = load_object_drop_zones()
     print(f"[DROP ZONES] Loaded {len(drop_zones)} fixed drop coordinate(s)")
+    # Mood analyzer for emotion-aware behaviour
+    try:
+        mood_analyzer = MoodAnalyzer()
+    except Exception:
+        mood_analyzer = None
 
     # ── main loop ──
     while True:
@@ -907,6 +973,30 @@ def main():
             continue
         frame = cv2.remap(frame, map1, map2, cv2.INTER_LINEAR)   # undistort
         display = frame.copy()
+        # update mood from face model (if available)
+        try:
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            mood = mood_analyzer.update(frame_rgb, int(time.perf_counter() * 1000)) if mood_analyzer is not None else "neutral"
+        except Exception:
+            mood = "neutral"
+        # write mood to ui/mood.json and append a brief log (atomic)
+        try:
+            ui_dir = os.path.join(os.path.dirname(__file__), 'ui')
+            os.makedirs(ui_dir, exist_ok=True)
+            mood_path = os.path.join(ui_dir, 'mood.json')
+            mood_tmp = mood_path + '.tmp'
+            with open(mood_tmp, 'w') as mf:
+                mf.write('{"mood": "' + str(mood) + '", "ts": ' + str(int(time.time())) + '}')
+            try:
+                os.replace(mood_tmp, mood_path)
+            except Exception:
+                os.rename(mood_tmp, mood_path)
+            # append to mood log
+            log_path = os.path.join(ui_dir, 'mood.log')
+            with open(log_path, 'a') as lf:
+                lf.write(f"{int(time.time())}, {mood}\n")
+        except Exception:
+            pass
         # Perception
         hand_blocked = False
         safety_reasons = []
@@ -928,12 +1018,20 @@ def main():
 
         now = time.time()
 
-        # ── Speed computation ──
-        effective_speed = compute_pace_speed(list(intervals))
-        dobotArm.set_speed(api, effective_speed)
+        # ── Speed computation (pace + emotion) ──
+        base_speed = compute_pace_speed(list(intervals))
+        emo = EMOTIONS.get(mood, EMOTIONS["neutral"]) if 'EMOTIONS' in globals() else {"speed": 1.0, "acceleration": 1.0}
+        scaled_speed = max(MIN_SPEED, min(MAX_SPEED, int(base_speed * emo.get("speed", 1.0))))
+        # set robot speed (wrapper will clamp)
+        try:
+            # set both speed and acceleration conservatively
+            accel_pct = max(1, min(100, int(scaled_speed * emo.get("acceleration", 1.0))))
+            dobotArm.set_speed(api, scaled_speed, accel_pct)
+        except Exception:
+            dobotArm.set_speed(api, scaled_speed)
 
         # ── Drawing ──
-        draw_status_panel(display, state, effective_speed, hand_blocked,
+        draw_status_panel(display, state, scaled_speed, hand_blocked,
                           sum(intervals) / len(intervals) if intervals else None,
                           block_count, colour_counts, drop_zones)
 
@@ -1057,6 +1155,13 @@ def main():
         elif state == "pick_move":
             rx, ry = target_robot
             print(f"[PICK MOVE] ({rx:.1f}, {ry:.1f}, Z={Z_SAFE})")
+            # run a small pre-animation depending on detected mood
+            try:
+                emo = EMOTIONS.get(mood, EMOTIONS["neutral"]) if 'EMOTIONS' in globals() else None
+                if emo and emo.get("pre_animation"):
+                    perform_animation(api, emo.get("pre_animation"))
+            except Exception:
+                pass
             state = "pick_lower" if safe_move_to_xyz(api, rx, ry, Z_SAFE) else "watching"
 
         # ── PICK: Lower to Z_PICK, then grip with verification & retries ──
@@ -1071,6 +1176,15 @@ def main():
             success = False
             for attempt in range(PICK_RETRY_COUNT + 1):
                 print(f"[GRIPPER] Closing... (attempt {attempt+1})")
+                try:
+                    emo = EMOTIONS.get(mood, EMOTIONS["neutral"]) if 'EMOTIONS' in globals() else None
+                    grip_force = emo.get("grip_force", "normal") if emo else "normal"
+                    if grip_force == "gentle":
+                        time.sleep(0.12)
+                    elif grip_force == "hard":
+                        time.sleep(0.02)
+                except Exception:
+                    pass
                 dobotArm.close_gripper(api)
                 # Raise slightly to clear surface for a quick check
                 if not safe_move_to_xyz(api, rx, ry, PICK_RAISE_CHECK):
@@ -1171,6 +1285,16 @@ def main():
                 active_block = None
                 hold_count = 0
             print(f"[PLACE] #{colour_counts[target_route]} {target_colour} delivered to {target_route}")
+            # post-animation and pause based on emotion
+            try:
+                emo = EMOTIONS.get(mood, EMOTIONS["neutral"]) if 'EMOTIONS' in globals() else None
+                if emo and emo.get("post_animation"):
+                    perform_animation(api, emo.get("post_animation"))
+                pause_t = emo.get("pause_time", 0) if emo else 0
+                if pause_t and pause_t > 0:
+                    time.sleep(pause_t)
+            except Exception:
+                pass
             state = "place_rotate"
             print(f"[STATE] → place_rotate")
 
