@@ -30,17 +30,10 @@ def _spin(api, times=1, speed_delay=0.4):
 
 
 def _nod(api):
-    pose = dobotArm.api and dobotArm.api or None
-    # Use move_to_xyz to dip the arm slightly and return
     try:
-        p = dobotArm.api
-    except Exception:
-        p = None
-    # Best-effort: move down a little and back up
-    try:
-        dobotArm.move_to_xyz(dobotArm.api, dobotArm.home_pos[0], dobotArm.home_pos[1], dobotArm.home_pos[2] - 15)
+        _safe_move(api, dobotArm.home_pos[0], dobotArm.home_pos[1], dobotArm.home_pos[2] - 15)
         time.sleep(0.6)
-        dobotArm.move_to_xyz(dobotArm.api, dobotArm.home_pos[0], dobotArm.home_pos[1], dobotArm.home_pos[2])
+        _safe_move(api, dobotArm.home_pos[0], dobotArm.home_pos[1], dobotArm.home_pos[2])
     except Exception:
         pass
 
