@@ -22,7 +22,6 @@
 
     <div class="mood-panel">
       <div id="moodBadge" class="mood-badge" title="mood: unknown"><span id="moodEmoji" class="mood-emoji">😐</span></div>
-      <a href="/mood.log" target="_blank" class="mood-log">View mood log</a>
     </div>
 
     <section class="description">
@@ -37,6 +36,18 @@
         Usage: allow camera access when prompted. If the camera is unavailable the page will show the
         background image instead
       </p>
+    </section>
+
+    <section class="controls">
+      <h3>Trigger an emotion</h3>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;">
+        <button class="mood-btn" data-mood="happy">Happy</button>
+        <button class="mood-btn" data-mood="sad">Sad</button>
+        <button class="mood-btn" data-mood="angry">Angry</button>
+        <button class="mood-btn" data-mood="tired">Tired</button>
+        <button class="mood-btn" data-mood="focused">Focused</button>
+        <button class="mood-btn" data-mood="neutral">Neutral</button>
+      </div>
     </section>
   </main>
 
@@ -116,6 +127,18 @@
       updateOnce();
       setInterval(updateOnce, 1000);
     })();
+
+      // Hook up mood buttons to trigger robot movements
+      document.querySelectorAll('.mood-btn').forEach(btn => {
+        btn.addEventListener('click', async () => {
+          const mood = btn.getAttribute('data-mood');
+          try{
+            await fetch('/trigger_mood', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({mood})});
+          }catch(e){
+            console.warn('Failed to trigger mood', e);
+          }
+        });
+      });
   </script>
 </body>
 </html>
