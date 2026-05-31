@@ -116,7 +116,7 @@ MIN_SPEED    = 25     # never go below this
 FAST_PACE_S  = 3.0    # if avg interval < this, robot speeds up
 SLOW_PACE_S  = 8.0    # if avg interval > this, robot slows down
 
-HOLD_FRAMES = 8
+HOLD_FRAMES = 4
 PICK_PROXIMITY_PX = 30  # blocks within this many pixels are considered the same
 PICK_RETRY_COUNT = 2
 PICK_RAISE_CHECK = -15  # raise to this Z to perform a quick pickup check
@@ -1185,19 +1185,11 @@ def main():
     target_colour = None                                  # colour of current target
     target_route = None                                   # detected destination zone key
     target_box = None                                     # camera box of current target
-    last_pick_time = time.time()                          # when the last block was placed
-    picked_ids = set()                                    # set of (px, py, colour) already picked
+    last_pick_time = time.time()                          # when the robot became ready for the next object
     hold_count = 0                                        # frames the current block has been stable
     active_block = None                                   # (px, py, colour) we're currently watching
-    last_cycle_time = 0                                   # timestamp of last completed pick cycle
     drop_zones = load_object_drop_zones()
     print(f"[DROP ZONES] Loaded {len(drop_zones)} fixed drop coordinate(s)")
-    # Mood analyzer for emotion-aware behaviour
-    try:
-        mood_analyzer = MoodAnalyzer()
-    except Exception:
-        mood_analyzer = None
-
     # ── main loop ──
     while True:
         # ── Read and preprocess camera frame ──
@@ -1206,30 +1198,6 @@ def main():
             continue
         frame = cv2.remap(frame, map1, map2, cv2.INTER_LINEAR)   # undistort
         display = frame.copy()
-        # update mood from face model (if available)
-        try:
-            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            mood = mood_analyzer.update(frame_rgb, int(time.perf_counter() * 1000)) if mood_analyzer is not None else "neutral"
-        except Exception:
-            mood = "neutral"
-        # write mood to ui/mood.json and append a brief log (atomic)
-        try:
-            ui_dir = os.path.join(os.path.dirname(__file__), 'ui')
-            os.makedirs(ui_dir, exist_ok=True)
-            mood_path = os.path.join(ui_dir, 'mood.json')
-            mood_tmp = mood_path + '.tmp'
-            with open(mood_tmp, 'w') as mf:
-                mf.write('{"mood": "' + str(mood) + '", "ts": ' + str(int(time.time())) + '}')
-            try:
-                os.replace(mood_tmp, mood_path)
-            except Exception:
-                os.rename(mood_tmp, mood_path)
-            # append to mood log
-            log_path = os.path.join(ui_dir, 'mood.log')
-            with open(log_path, 'a') as lf:
-                lf.write(f"{int(time.time())}, {mood}\n")
-        except Exception:
-            pass
         # Perception
         hand_blocked = False
         safety_reasons = []
@@ -1256,30 +1224,22 @@ def main():
             safety_reasons.append(work_zone_safety.last_reason or "work-zone")
         hand_blocked = hand_blocked or work_zone_blocked
         zone_objects = detect_pickable_objects(frame)
-        unpicked = [obj for obj in zone_objects if not matches(obj, picked_ids)]  # minus already-picked
+        visible_objects = zone_objects
 
         now = time.time()
 
         # ── Speed computation (pace + emotion) ──
-        base_speed = compute_pace_speed(list(intervals))
-        emo = EMOTIONS.get(mood, EMOTIONS["neutral"]) if 'EMOTIONS' in globals() else {"speed": 1.0, "acceleration": 1.0}
-        scaled_speed = max(MIN_SPEED, min(MAX_SPEED, int(base_speed * emo.get("speed", 1.0))))
-        # set robot speed (wrapper will clamp)
-        try:
-            # set both speed and acceleration conservatively
-            accel_pct = max(1, min(100, int(scaled_speed * emo.get("acceleration", 1.0))))
-            dobotArm.set_speed(api, scaled_speed, accel_pct)
-        except Exception:
-            dobotArm.set_speed(api, scaled_speed)
+        effective_speed = compute_pace_speed(list(intervals))
+        dobotArm.set_speed(api, effective_speed)
 
         # ── Drawing ──
-        draw_status_panel(display, state, scaled_speed, hand_blocked,
+        draw_status_panel(display, state, effective_speed, hand_blocked,
                           sum(intervals) / len(intervals) if intervals else None,
                           block_count, colour_counts, drop_zones)
 
         # Highlight only the active/next target to keep the preview readable.
-        draw_detected_objects(display, unpicked, active_block)
-        if not unpicked and generic_detector.frames < GENERIC_WARMUP_FRAMES:
+        draw_detected_objects(display, visible_objects, active_block)
+        if not visible_objects and generic_detector.frames < GENERIC_WARMUP_FRAMES:
             cv2.putText(display, "Learning empty zone - keep clear",
                         (PZ_X1 + 20, PZ_Y1 + 35),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 255), 2)
@@ -1293,21 +1253,14 @@ def main():
         if key == ord('q'):
             break
         if key == ord('r'):
-            picked_ids.clear()
             generic_detector.reset()
             active_block = None
             hold_count = 0
-            print("[RESET] Cleared picked-block memory")
+            print("[RESET] Relearned the empty placement zone")
 
         # ── Enforce minimum 2-second gap between pick cycles ──
         # Prevents the robot from immediately re-entering a cycle after
         # returning to ready (gives the human time to place another block).
-        if state not in ("watching", "pick_move", "pick_lower"):
-            last_cycle_time = now
-        if state == "watching" and now - last_cycle_time < 2.0:
-            cv2.imshow(WINDOW_NAME, display)
-            continue
-
         # ── Manual test mode (M key) ──
         # Blocking — camera feed freezes during the move.
         if key == ord('m') and state == "watching":
@@ -1343,17 +1296,17 @@ def main():
             continue
 
         if state == "watching":
-            if not unpicked:
+            if not visible_objects:
                 active_block = None
                 hold_count = 0
                 cv2.imshow(WINDOW_NAME, display)
                 continue
 
             if active_block is None:
-                active_block = unpicked[0]
+                active_block = visible_objects[0]
                 hold_count = 0
                 print(f"[TRACKING] {active_block[2]} at px ({active_block[0]}, {active_block[1]})")
-            elif not matches(active_block, unpicked):
+            elif not matches(active_block, visible_objects):
                 # The block we were tracking disappeared — reset
                 active_block = None
                 hold_count = 0
@@ -1363,6 +1316,8 @@ def main():
             hold_count += 1
 
             if hold_count >= HOLD_FRAMES and active_block is not None:
+                if block_count > 0:
+                    intervals.append(now - last_pick_time)
                 target_pixel = active_block[:2]
                 target_colour = active_block[2]
                 target_route = active_block[3]
@@ -1387,20 +1342,12 @@ def main():
                       f"px=({target_pixel[0]},{target_pixel[1]}) "
                       f"-> {target_route} zone -> robot ({rx:.1f}, {ry:.1f})")
                 state = "pick_move"
-                last_cycle_time = time.time()
                 print(f"[STATE] → pick_move")
 
         # ── PICK: Move XY above block ──
         elif state == "pick_move":
             rx, ry = target_robot
             print(f"[PICK MOVE] ({rx:.1f}, {ry:.1f}, Z={Z_SAFE})")
-            # run a small pre-animation depending on detected mood
-            try:
-                emo = EMOTIONS.get(mood, EMOTIONS["neutral"]) if 'EMOTIONS' in globals() else None
-                if emo and emo.get("pre_animation"):
-                    perform_animation(api, emo.get("pre_animation"))
-            except Exception:
-                pass
             state = "pick_lower" if safe_move_to_xyz(api, rx, ry, Z_SAFE) else "watching"
 
         # ── PICK: Lower to Z_PICK, then grip with verification & retries ──
@@ -1522,35 +1469,17 @@ def main():
                 state = "watching"
                 continue
 
-            # Record the time interval since the last pick
             now = time.time()
-            if block_count > 0:
-                intervals.append(now - last_pick_time)
-            last_pick_time = now
             block_count += 1
             colour_counts.setdefault(target_route, 0)
             colour_counts[target_route] += 1
 
-            # Mark this block as picked (by pixel coordinate + colour)
             if target_pixel is not None:
-                picked_ids.add((target_pixel[0], target_pixel[1], target_colour))
                 active_block = None
                 hold_count = 0
             print(f"[PLACE] #{colour_counts[target_route]} {target_colour} delivered to {target_route}")
             state = "return_xy"
             print("[STATE] -> return_xy")
-            # post-animation and pause based on emotion
-            try:
-                emo = EMOTIONS.get(mood, EMOTIONS["neutral"]) if 'EMOTIONS' in globals() else None
-                if emo and emo.get("post_animation"):
-                    perform_animation(api, emo.get("post_animation"))
-                pause_t = emo.get("pause_time", 0) if emo else 0
-                if pause_t and pause_t > 0:
-                    time.sleep(pause_t)
-            except Exception:
-                pass
-            state = "place_rotate"
-            print(f"[STATE] → place_rotate")
 
         # ── PLACE: Rotate wrist back to 0° (neutral) ──
         elif state == "place_rotate":
@@ -1564,6 +1493,7 @@ def main():
             pace = sum(intervals) / len(intervals) if intervals else None
             print(f"[READY] Pace: {pace:.1f}s" if pace else "[READY]")
             print()
+            last_pick_time = time.time()
             active_block = None
             target_robot = None
             target_pixel = None
@@ -1578,7 +1508,7 @@ def main():
 
         # Export a JPEG for the UI server to show (atomic write)
         try:
-            ui_dir = os.path.join(os.path.dirname(__file__), 'ui')
+            ui_dir = os.path.join(os.path.dirname(__file__), 'UI')
             os.makedirs(ui_dir, exist_ok=True)
             tmp_path = os.path.join(ui_dir, 'latest.jpg.tmp')
             out_path = os.path.join(ui_dir, 'latest.jpg')

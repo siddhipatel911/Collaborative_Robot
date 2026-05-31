@@ -14,14 +14,13 @@
   </header>
 
   <main class="content">
-    <div class="camera-card">
-      <img id="mjpeg" alt="camera stream" style="display:none;width:100%;height:100%;object-fit:cover;" />
-      <video id="camera" autoplay playsinline muted style="display:none;width:100%;height:100%;object-fit:cover;"></video>
+    <div class="camera-card" id="cameraCard">
+      <img id="liveFrame" alt="camera stream" style="width:100%;height:100%;object-fit:cover;" />
       <div class="camera-overlay">Live Camera</div>
     </div>
 
     <div class="mood-panel">
-      <div id="moodBadge" class="mood-badge" title="mood: unknown"><span id="moodEmoji" class="mood-emoji">😐</span></div>
+      <div id="moodBadge" class="mood-badge" title="mood: unknown"><span id="moodEmoji" class="mood-emoji">?</span></div>
       <a href="/mood.log" target="_blank" class="mood-log">View mood log</a>
     </div>
 
@@ -34,87 +33,72 @@
         model. Use this page to preview the camera feed while running the robot software.
       </p>
       <p>
-        Usage: allow camera access when prompted. If the camera is unavailable the page will show the
-        background image instead
+        The stream is provided by <code>collaborative_demo.py</code>. Make sure it is running to see live
+        camera feed with detection overlays.
       </p>
     </section>
   </main>
 
   <script>
-    // Try MJPEG stream first (served by ui/app.py at /stream). If not available, fall back to getUserMedia.
-    function tryMjpegThenGetUserMedia() {
-      const mjpeg = document.getElementById('mjpeg');
-      const video = document.getElementById('camera');
+    (function() {
+      const img = document.getElementById('liveFrame');
+      let active = true;
+      let frameId = 0;
 
-      // Probe the MJPEG endpoint by loading it into an Image object
-      const probe = new Image();
-      let timedOut = false;
-      const timeout = setTimeout(() => { timedOut = true; probe.src = ''; probe.onload = probe.onerror = null; startGetUserMedia(); }, 1200);
-
-      probe.onload = () => {
-        if (timedOut) return;
-        clearTimeout(timeout);
-        // MJPEG is available
-        mjpeg.src = '/stream';
-        mjpeg.style.display = '';
-      };
-      probe.onerror = () => {
-        if (timedOut) return;
-        clearTimeout(timeout);
-        startGetUserMedia();
-      };
-      // Start probing
-      probe.src = '/stream';
-
-      async function startGetUserMedia() {
-        try {
-          const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
-          video.srcObject = stream;
-          video.style.display = '';
-        } catch (err) {
-          document.querySelector('.camera-card').classList.add('no-camera');
-          video.style.display = 'none';
-          const note = document.createElement('div');
-          note.className = 'no-camera-note';
-          note.innerText = 'Camera access denied or not available. Background image shown.';
-          document.querySelector('.camera-card').appendChild(note);
-        }
+      function pollFrame() {
+        if (!active) return;
+        const ts = Date.now();
+        frameId++;
+        const id = frameId;
+        fetch('/frame?_=' + ts, { cache: 'no-store' })
+          .then(function(r) {
+            if (!r.ok) throw new Error('status ' + r.status);
+            return r.blob();
+          })
+          .then(function(blob) {
+            if (!active || id !== frameId) return;
+            var url = URL.createObjectURL(blob);
+            img.onload = function() {
+              URL.revokeObjectURL(url);
+              img.onload = null;
+            };
+            img.src = url;
+          })
+          .catch(function() {
+            // server not ready
+          });
+        setTimeout(pollFrame, 66);
       }
-    }
 
-    tryMjpegThenGetUserMedia();
+      pollFrame();
 
-    // Poll server for mood and show a small emoji (smoji) instead of text
-    (function pollMood(){
-      const emojiMap = {
-        "neutral": "😐",
-        "happy":   "😄",
-        "sad":     "😢",
-        "angry":   "😠",
-        "tired":   "😴",
-        "agitated":"😤",
-        "focused": "🤓",
-        "no_face": "👤",
-        "unknown": "❓"
+      // Poll mood separately
+      var emojiMap = {
+        "neutral": "&#x1F610;",
+        "happy":   "&#x1F604;",
+        "sad":     "&#x1F622;",
+        "angry":   "&#x1F620;",
+        "tired":   "&#x1F634;",
+        "agitated":"&#x1F624;",
+        "focused": "&#x1F913;",
+        "no_face": "&#x1F464;",
+        "unknown": "&#x2753;"
       };
-      const badge = document.getElementById('moodBadge');
-      const emoji = document.getElementById('moodEmoji');
-      async function updateOnce(){
-        try{
-          const res = await fetch('/mood.json', {cache: 'no-store'});
-          if(!res.ok) throw new Error('no mood');
-          const data = await res.json();
-          const m = (data && data.mood) ? data.mood : 'unknown';
-          const glyph = emojiMap[m] || emojiMap['unknown'];
-          if(emoji) emoji.textContent = glyph;
-          if(badge) badge.title = `mood: ${m}`;
-        }catch(e){
-          if(emoji) emoji.textContent = emojiMap['unknown'];
-          if(badge) badge.title = `mood: unknown`;
-        }
+      var badge = document.getElementById('moodBadge');
+      var emoji = document.getElementById('moodEmoji');
+      function pollMood() {
+        fetch('/mood.json', {cache: 'no-store'})
+          .then(function(r) { return r.json(); })
+          .then(function(data) {
+            var m = (data && data.mood) ? data.mood : 'unknown';
+            var glyph = emojiMap[m] || emojiMap['unknown'];
+            if (emoji) emoji.innerHTML = glyph;
+            if (badge) badge.title = 'mood: ' + m;
+          })
+          .catch(function() {});
       }
-      updateOnce();
-      setInterval(updateOnce, 1000);
+      pollMood();
+      setInterval(pollMood, 1000);
     })();
   </script>
 </body>
