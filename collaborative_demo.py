@@ -48,6 +48,7 @@ import time
 from collections import deque
 import os
 import json
+from pathlib import Path
 
 try:
     from hand_safety import HandSafety
@@ -98,6 +99,9 @@ PZ_X1, PZ_Y1 = 50, 20   # top-left corner
 PZ_X2, PZ_Y2 = 650, 315   # bottom-right corner
 WINDOW_NAME = "Collaborative Robot Demo"
 HSV_CONFIG_FILE = "hsv_ranges.json"
+OBJECT_TEMPLATE_DIR = "object_templates"
+OBJECT_ROUTE_FILE = "object_routes.json"
+OBJECT_DROP_ZONE_FILE = "object_drop_zones.json"
 
 # -- Speed adaptation --
 SPEED_WINDOW = 5      # number of recent pick intervals to average
@@ -113,7 +117,11 @@ PICK_RETRY_COUNT = 2
 PICK_RAISE_CHECK = -15  # raise to this Z to perform a quick pickup check
 MIN_BLOCK_AREA = 400
 MIN_DROP_ZONE_AREA = 1200
-DROP_ZONE_SCAN_INTERVAL = 0.5
+TEMPLATE_SCAN_INTERVAL = 0.4
+TEMPLATE_MATCH_THRESHOLD = 0.58
+TEMPLATE_MIN_SIZE = 16
+TEMPLATE_MAX_SIZE = 120
+TEMPLATE_SCALES = (0.25, 0.35, 0.5, 0.7, 0.9, 1.1)
 MOTION_MIN_AREA = 1800
 MOTION_WARMUP_FRAMES = 20
 MOTION_BLOCK_FRAMES = 2
@@ -137,6 +145,19 @@ DEFAULT_COLOUR_HSV = {
     "blue": [
         [[90, 80, 70], [130, 255, 255]],
     ],
+}
+
+DEFAULT_OBJECT_DROP_ZONES = {
+    "redstrip": [260, -120],
+    "pinkblock": [260, -80],
+    "purpleblock": [260, -40],
+    "greyblock": [260, 0],
+    "chargerblock": [260, 40],
+    "ledbox": [260, 80],
+    "lipbalm": [260, 120],
+    "red": [280, -80],
+    "green": [280, 0],
+    "blue": [280, 80],
 }
 
 # Kept only so the old MoodAnalyzer helper remains import-safe; main() no longer
@@ -402,6 +423,132 @@ def load_colour_hsv(path=HSV_CONFIG_FILE):
 COLOUR_HSV = load_colour_hsv()
 
 
+def load_object_routes(path=OBJECT_ROUTE_FILE):
+    defaults = {}
+    if not os.path.exists(path):
+        return defaults
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            loaded = json.load(f)
+        if isinstance(loaded, dict):
+            defaults.update({str(k): str(v) for k, v in loaded.items()})
+    except Exception as e:
+        print(f"[WARN] Failed to load {path}: {e}; using default object routes")
+    return defaults
+
+
+OBJECT_ROUTES = load_object_routes()
+
+
+def load_object_drop_zones(path=OBJECT_DROP_ZONE_FILE):
+    zones = DEFAULT_OBJECT_DROP_ZONES.copy()
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                loaded = json.load(f)
+            if isinstance(loaded, dict):
+                for name, xy in loaded.items():
+                    if isinstance(xy, (list, tuple)) and len(xy) == 2:
+                        zones[str(name).lower()] = [float(xy[0]), float(xy[1])]
+        except Exception as e:
+            print(f"[WARN] Failed to load {path}: {e}; using default drop coordinates")
+
+    safe_zones = {}
+    for name, xy in zones.items():
+        x, y = xy
+        if is_robot_xy_safe(x, y):
+            safe_zones[name] = {
+                "pixel": None,
+                "robot": (x, y),
+                "area": 0,
+                "score": 1.0,
+                "kind": "fixed",
+            }
+        else:
+            print(f"[WARN] Drop zone for {name} is outside workspace and was ignored: ({x}, {y})")
+    return safe_zones
+
+
+class TemplateObjectDetector:
+    def __init__(self, template_dir=OBJECT_TEMPLATE_DIR):
+        self.templates = []
+        self._load_templates(template_dir)
+
+    def _load_templates(self, template_dir):
+        root = Path(template_dir)
+        if not root.exists():
+            print(f"[OBJECTS] Template folder not found: {template_dir}")
+            return
+        for path in sorted(root.iterdir()):
+            if path.suffix.lower() not in (".png", ".jpg", ".jpeg", ".webp"):
+                continue
+            image = cv2.imread(str(path))
+            if image is None:
+                continue
+            name = path.stem.lower()
+            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+            gray = cv2.GaussianBlur(gray, (3, 3), 0)
+            edges = cv2.Canny(gray, 50, 150)
+            variants = []
+            for scale in TEMPLATE_SCALES:
+                w = int(edges.shape[1] * scale)
+                h = int(edges.shape[0] * scale)
+                if w < TEMPLATE_MIN_SIZE or h < TEMPLATE_MIN_SIZE:
+                    continue
+                if w > TEMPLATE_MAX_SIZE or h > TEMPLATE_MAX_SIZE:
+                    continue
+                variants.append(cv2.resize(edges, (w, h), interpolation=cv2.INTER_AREA))
+            if variants:
+                self.templates.append({"name": name, "variants": variants})
+        print(f"[OBJECTS] Loaded {len(self.templates)} object template(s)")
+
+    def detect(self, frame, region=None):
+        if not self.templates:
+            return []
+        if region is None:
+            region = (PZ_X1, PZ_Y1, PZ_X2, PZ_Y2)
+        x1, y1, x2, y2 = region
+        zone = frame[y1:y2, x1:x2]
+        if zone.size == 0:
+            return []
+        gray = cv2.cvtColor(zone, cv2.COLOR_BGR2GRAY)
+        gray = cv2.GaussianBlur(gray, (3, 3), 0)
+        edges = cv2.Canny(gray, 50, 150)
+
+        matches_found = []
+        for template in self.templates:
+            best = None
+            for tmpl in template["variants"]:
+                th, tw = tmpl.shape[:2]
+                if th >= edges.shape[0] or tw >= edges.shape[1]:
+                    continue
+                result = cv2.matchTemplate(edges, tmpl, cv2.TM_CCOEFF_NORMED)
+                _, score, _, loc = cv2.minMaxLoc(result)
+                if best is None or score > best["score"]:
+                    best = {"score": score, "loc": loc, "size": (tw, th)}
+            if best and best["score"] >= TEMPLATE_MATCH_THRESHOLD:
+                x, y = best["loc"]
+                tw, th = best["size"]
+                cx = x1 + x + tw // 2
+                cy = y1 + y + th // 2
+                route = OBJECT_ROUTES.get(template["name"], template["name"])
+                matches_found.append((cx, cy, template["name"], best["score"], route, (x1 + x, y1 + y, tw, th)))
+
+        matches_found.sort(key=lambda item: item[3], reverse=True)
+        return self._suppress_overlaps(matches_found)
+
+    def _suppress_overlaps(self, detections):
+        kept = []
+        for det in detections:
+            x, y, _, _, _, _ = det
+            if all(abs(x - k[0]) > PICK_PROXIMITY_PX or abs(y - k[1]) > PICK_PROXIMITY_PX for k in kept):
+                kept.append(det)
+        return kept
+
+
+template_detector = TemplateObjectDetector()
+
+
 def mask_for_colour(hsv, ranges):
     mask = np.zeros(hsv.shape[:2], dtype=np.uint8)
     for lower, upper in ranges:
@@ -440,19 +587,18 @@ def detect_coloured_blocks(frame):
     return blocks
 
 
-def detect_drop_zones(frame):
-    """Detect the largest configured colour target outside the placement zone."""
-    zones = {}
-    for cx, cy, colour, area in detect_coloured_objects(frame, MIN_DROP_ZONE_AREA):
-        if PZ_X1 <= cx <= PZ_X2 and PZ_Y1 <= cy <= PZ_Y2:
+def detect_pickable_objects(frame):
+    """Use templates first, then colour fallback for older tag-style parts."""
+    objects = []
+    for cx, cy, name, score, route, box in template_detector.detect(frame):
+        objects.append((cx, cy, name, route, score, box))
+
+    for cx, cy, colour in detect_coloured_blocks(frame):
+        if any(abs(cx - obj[0]) < PICK_PROXIMITY_PX and abs(cy - obj[1]) < PICK_PROXIMITY_PX for obj in objects):
             continue
-        rx, ry = pixel_to_robot(cx, cy, H_matrix)
-        if not is_robot_xy_safe(rx, ry):
-            continue
-        current = zones.get(colour)
-        if current is None or area > current["area"]:
-            zones[colour] = {"pixel": (cx, cy), "robot": (rx, ry), "area": area}
-    return zones
+        objects.append((cx, cy, colour, colour, 1.0, None))
+
+    return objects
 
 
 def is_robot_xy_safe(x, y):
@@ -633,12 +779,14 @@ def draw_status_panel(display, state, speed, hand_blocked, pace, block_count, co
 
     # Drop-zone legend (right side of screen)
     lx, ly = 540, 145
-    for colour in sorted(COLOUR_HSV):
+    zone_keys = set(COLOUR_HSV)
+    zone_keys.update(drop_zones)
+    for colour in sorted(zone_keys):
         zone = drop_zones.get(colour)
         cv2.circle(display, (lx, ly), 8, COLOUR_BGR.get(colour, (255, 255, 255)), -1)
         if zone:
             dx, dy = zone["robot"]
-            text = f"{colour} ({dx:.0f},{dy:.0f})"
+            text = f"{colour} {zone.get('kind', 'zone')} ({dx:.0f},{dy:.0f})"
         else:
             text = f"{colour} zone: searching"
         cv2.putText(display, text, (lx + 14, ly + 4),
@@ -647,9 +795,23 @@ def draw_status_panel(display, state, speed, hand_blocked, pace, block_count, co
 
     for colour, zone in drop_zones.items():
         px, py = zone["pixel"]
+        if px is None or py is None:
+            continue
         cv2.circle(display, (px, py), 14, COLOUR_BGR.get(colour, (255, 255, 255)), 2)
         cv2.putText(display, f"{colour} drop", (px + 12, py),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.45, COLOUR_BGR.get(colour, (255, 255, 255)), 2)
+
+
+def draw_detected_objects(display, objects):
+    for cx, cy, name, route, score, box in objects:
+        color = COLOUR_BGR.get(route, (255, 255, 255))
+        if box:
+            x, y, w, h = box
+            cv2.rectangle(display, (x, y), (x + w, y + h), color, 2)
+        cv2.circle(display, (cx, cy), 8, color, -1)
+        label = f"{name}->{route}" if route else f"{name}: no route"
+        cv2.putText(display, f"{label} {score:.2f}", (cx + 10, cy),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.42, color, 2)
 
 
 def draw_face_expression(display, mood, x=10, y=100, size=35):
@@ -694,8 +856,9 @@ def draw_face_expression(display, mood, x=10, y=100, size=35):
 def matches(block, block_list):
     """Check if a block (cx, cy, colour) is close enough to any block in the list
     (within PICK_PROXIMITY_PX pixels and same colour) to be considered the same one."""
-    bx, by, bc = block
-    for lx, ly, lc in block_list:
+    bx, by, bc = block[:3]
+    for item in block_list:
+        lx, ly, lc = item[:3]
         if lc == bc and abs(bx - lx) < PICK_PROXIMITY_PX and abs(by - ly) < PICK_PROXIMITY_PX:
             return True
     return False
@@ -727,13 +890,14 @@ def main():
     target_robot = None                                   # robot XY of current target (mm)
     target_pixel = None                                   # pixel XY of current target
     target_colour = None                                  # colour of current target
+    target_route = None                                   # detected destination zone key
     last_pick_time = time.time()                          # when the last block was placed
     picked_ids = set()                                    # set of (px, py, colour) already picked
     hold_count = 0                                        # frames the current block has been stable
     active_block = None                                   # (px, py, colour) we're currently watching
     last_cycle_time = 0                                   # timestamp of last completed pick cycle
-    drop_zones = {}
-    last_drop_zone_scan = 0
+    drop_zones = load_object_drop_zones()
+    print(f"[DROP ZONES] Loaded {len(drop_zones)} fixed drop coordinate(s)")
 
     # ── main loop ──
     while True:
@@ -759,17 +923,10 @@ def main():
         if work_zone_blocked:
             safety_reasons.append(work_zone_safety.last_reason or "work-zone")
         hand_blocked = hand_blocked or work_zone_blocked
-        blocks = detect_coloured_blocks(frame)                    # find all coloured blocks
-        zone_blocks = [(x, y, c) for x, y, c in blocks
-                       if PZ_X1 <= x <= PZ_X2 and PZ_Y1 <= y <= PZ_Y2]   # only those in zone
-        unpicked = [b for b in zone_blocks if not matches(b, picked_ids)]  # minus already-picked
+        zone_objects = detect_pickable_objects(frame)
+        unpicked = [obj for obj in zone_objects if not matches(obj, picked_ids)]  # minus already-picked
 
         now = time.time()
-        if now - last_drop_zone_scan >= DROP_ZONE_SCAN_INTERVAL:
-            detected_zones = detect_drop_zones(frame)
-            if detected_zones:
-                drop_zones.update(detected_zones)
-            last_drop_zone_scan = now
 
         # ── Speed computation ──
         effective_speed = compute_pace_speed(list(intervals))
@@ -781,16 +938,14 @@ def main():
                           block_count, colour_counts, drop_zones)
 
         # Highlight unpicked blocks with colour circles
-        for bx, by, bc in unpicked:
-            cv2.circle(display, (bx, by), 8, COLOUR_BGR.get(bc, (255, 255, 255)), -1)
-            cv2.circle(display, (bx, by), 8, (255, 255, 255), 1)
+        draw_detected_objects(display, unpicked)
 
         # Grey out already-picked blocks
-        for bx, by, bc in zone_blocks:
+        for bx, by, bc, *_ in zone_objects:
             if matches((bx, by, bc), picked_ids):
                 cv2.circle(display, (bx, by), 6, (100, 100, 100), -1)
 
-        cv2.putText(display, f"Unpicked: {len(unpicked)}  Zone: {len(zone_blocks)}",
+        cv2.putText(display, f"Unpicked: {len(unpicked)}  Zone: {len(zone_objects)}",
                     (10, 420), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
         if safety_reasons:
             cv2.putText(display, f"Blocked: {','.join(safety_reasons)}",
@@ -857,7 +1012,7 @@ def main():
             if active_block is None:
                 active_block = unpicked[0]
                 hold_count = 0
-                print(f"[TRACKING] {active_block[2]} block at px ({active_block[0]}, {active_block[1]})")
+                print(f"[TRACKING] {active_block[2]} at px ({active_block[0]}, {active_block[1]})")
             elif not matches(active_block, unpicked):
                 # The block we were tracking disappeared — reset
                 active_block = None
@@ -870,8 +1025,15 @@ def main():
             if hold_count >= HOLD_FRAMES and active_block is not None:
                 target_pixel = active_block[:2]
                 target_colour = active_block[2]
-                if target_colour not in drop_zones:
-                    print(f"[WAIT] No {target_colour} drop zone detected yet")
+                target_route = active_block[3]
+                if target_route is None:
+                    print(f"[WAIT] {target_colour} detected, but no route exists in {OBJECT_ROUTE_FILE}")
+                    active_block = None
+                    hold_count = 0
+                    cv2.imshow(WINDOW_NAME, display)
+                    continue
+                if target_route not in drop_zones:
+                    print(f"[WAIT] No {target_route} drop zone detected yet for {target_colour}")
                     active_block = None
                     hold_count = 0
                     cv2.imshow(WINDOW_NAME, display)
@@ -884,9 +1046,9 @@ def main():
                     cv2.imshow(WINDOW_NAME, display)
                     continue
                 target_robot = (rx, ry)
-                print(f"\n[NEW {target_colour.upper()} BLOCK] "
+                print(f"\n[NEW {target_colour.upper()}] "
                       f"px=({target_pixel[0]},{target_pixel[1]}) "
-                      f"→ robot ({rx:.1f}, {ry:.1f})")
+                      f"-> {target_route} zone -> robot ({rx:.1f}, {ry:.1f})")
                 state = "pick_move"
                 last_cycle_time = time.time()
                 print(f"[STATE] → pick_move")
@@ -979,17 +1141,17 @@ def main():
 
         # ── PLACE: Move XY to the colour's drop zone ──
         elif state == "place_move":
-            if target_colour not in drop_zones:
-                print(f"[WAIT] Lost {target_colour} drop zone; waiting for detection")
+            if target_route not in drop_zones:
+                print(f"[WAIT] Lost {target_route} drop zone; waiting for detection")
                 cv2.imshow(WINDOW_NAME, display)
                 continue
-            dx, dy = drop_zones[target_colour]["robot"]
+            dx, dy = drop_zones[target_route]["robot"]
             print(f"[PLACE MOVE] ({dx:.1f}, {dy:.1f}, Z={Z_SAFE})")
             state = "place_drop" if safe_move_to_xyz(api, dx, dy, Z_SAFE) else "watching"
 
         # ── PLACE: Open gripper (release block), record stats ──
         elif state == "place_drop":
-            dx, dy = drop_zones[target_colour]["robot"]
+            dx, dy = drop_zones[target_route]["robot"]
             dobotArm.open_gripper(api)
             dobotArm.stop_pump(api)
             print(f"[DROP] released at ({dx:.1f}, {dy:.1f})")
@@ -1000,14 +1162,15 @@ def main():
                 intervals.append(now - last_pick_time)
             last_pick_time = now
             block_count += 1
-            colour_counts[target_colour] += 1
+            colour_counts.setdefault(target_route, 0)
+            colour_counts[target_route] += 1
 
             # Mark this block as picked (by pixel coordinate + colour)
             if target_pixel is not None:
                 picked_ids.add((target_pixel[0], target_pixel[1], target_colour))
                 active_block = None
                 hold_count = 0
-            print(f"[PLACE] #{colour_counts[target_colour]} {target_colour} delivered")
+            print(f"[PLACE] #{colour_counts[target_route]} {target_colour} delivered to {target_route}")
             state = "place_rotate"
             print(f"[STATE] → place_rotate")
 

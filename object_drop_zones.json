@@ -1,0 +1,12 @@
+{
+  "redstrip": [260, -120],
+  "pinkblock": [260, -80],
+  "purpleblock": [260, -40],
+  "greyblock": [260, 0],
+  "chargerblock": [260, 40],
+  "ledbox": [260, 80],
+  "lipbalm": [260, 120],
+  "red": [280, -80],
+  "green": [280, 0],
+  "blue": [280, 80]
+}
