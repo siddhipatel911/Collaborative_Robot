@@ -102,6 +102,10 @@ HSV_CONFIG_FILE = "hsv_ranges.json"
 OBJECT_TEMPLATE_DIR = "object_templates"
 OBJECT_ROUTE_FILE = "object_routes.json"
 OBJECT_DROP_ZONE_FILE = "object_drop_zones.json"
+USE_TEMPLATE_OBJECT_DETECTION = False
+GENERIC_OBJECT_NAME = "object"
+GENERIC_DROP_KEY = "generic"
+GENERIC_DEBUG_OBJECT_MASK = False
 
 # -- Speed adaptation --
 SPEED_WINDOW = 5      # number of recent pick intervals to average
@@ -118,15 +122,35 @@ PICK_RAISE_CHECK = -15  # raise to this Z to perform a quick pickup check
 MIN_BLOCK_AREA = 400
 MIN_DROP_ZONE_AREA = 1200
 TEMPLATE_SCAN_INTERVAL = 0.4
-TEMPLATE_MATCH_THRESHOLD = 0.58
+TEMPLATE_MATCH_THRESHOLD = 0.36
 TEMPLATE_MIN_SIZE = 16
 TEMPLATE_MAX_SIZE = 120
-TEMPLATE_SCALES = (0.25, 0.35, 0.5, 0.7, 0.9, 1.1)
-MOTION_MIN_AREA = 1800
+TEMPLATE_WIDTHS = (18, 24, 32, 42, 56, 72, 96, 120)
+TEMPLATE_ROTATIONS = (-30, -15, 0, 15, 30, 45, 90)
+GENERIC_WARMUP_FRAMES = 25
+GENERIC_MIN_AREA = 450
+GENERIC_MIN_BOX_WIDTH = 18
+GENERIC_MIN_BOX_HEIGHT = 18
+GENERIC_MAX_ASPECT_RATIO = 4.8
+GENERIC_MIN_FILL_RATIO = 0.24
+GENERIC_BORDER_MARGIN = 8
+GENERIC_GRAY_DIFF_THRESHOLD = 18
+GENERIC_COLOR_DIFF_THRESHOLD = 18
+PICK_X_OFFSET_MM = 0.0
+PICK_Y_OFFSET_MM = 0.0
+MAX_OBJECTS_PER_FRAME = 6
+MOTION_MIN_AREA = 6500
 MOTION_WARMUP_FRAMES = 20
-MOTION_BLOCK_FRAMES = 2
-SKIN_MIN_AREA = 1800
-SAFETY_ZONE_MARGIN = 25
+MOTION_BLOCK_FRAMES = 6
+MOTION_MIN_BOX_WIDTH = 45
+MOTION_MIN_BOX_HEIGHT = 45
+MOTION_MIN_FILL_RATIO = 0.18
+SKIN_MIN_AREA = 6500
+SKIN_MIN_BOX_WIDTH = 45
+SKIN_MIN_BOX_HEIGHT = 45
+SKIN_MIN_FILL_RATIO = 0.25
+SAFETY_ZONE_MARGIN = 0
+ENABLE_MOTION_SAFETY = False
 
 # Movement limits keep bad camera calibration from sending impossible moves.
 # Recalibrate if a valid table point lands outside this box.
@@ -148,6 +172,7 @@ DEFAULT_COLOUR_HSV = {
 }
 
 DEFAULT_OBJECT_DROP_ZONES = {
+    "generic": [260, 0],
     "redstrip": [260, -120],
     "pinkblock": [260, -80],
     "purpleblock": [260, -40],
@@ -378,6 +403,14 @@ def pixel_to_robot(u, v, H):
     return xy[0], xy[1]
 
 
+def robot_to_pixel(x, y, H):
+    p = np.array([x, y, 1.0])
+    inv_h = np.linalg.inv(H)
+    uv = inv_h @ p
+    uv /= uv[2]
+    return int(round(uv[0])), int(round(uv[1]))
+
+
 def normalise_hsv_ranges(raw):
     """Accept the current JSON shape and the older single-colour shape."""
     if isinstance(raw, dict) and "colors" in raw:
@@ -476,6 +509,9 @@ class TemplateObjectDetector:
 
     def _load_templates(self, template_dir):
         root = Path(template_dir)
+        if not USE_TEMPLATE_OBJECT_DETECTION:
+            print("[OBJECTS] Template detection disabled; using generic object pickup")
+            return
         if not root.exists():
             print(f"[OBJECTS] Template folder not found: {template_dir}")
             return
@@ -486,21 +522,81 @@ class TemplateObjectDetector:
             if image is None:
                 continue
             name = path.stem.lower()
+            image = self._crop_template_object(image)
             gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
             gray = cv2.GaussianBlur(gray, (3, 3), 0)
-            edges = cv2.Canny(gray, 50, 150)
             variants = []
-            for scale in TEMPLATE_SCALES:
-                w = int(edges.shape[1] * scale)
-                h = int(edges.shape[0] * scale)
-                if w < TEMPLATE_MIN_SIZE or h < TEMPLATE_MIN_SIZE:
-                    continue
-                if w > TEMPLATE_MAX_SIZE or h > TEMPLATE_MAX_SIZE:
-                    continue
-                variants.append(cv2.resize(edges, (w, h), interpolation=cv2.INTER_AREA))
+            for angle in TEMPLATE_ROTATIONS:
+                rotated = self._rotate_bound(gray, angle)
+                edges = cv2.Canny(rotated, 40, 130)
+                for target_w in TEMPLATE_WIDTHS:
+                    scale = target_w / max(1, edges.shape[1])
+                    w = int(edges.shape[1] * scale)
+                    h = int(edges.shape[0] * scale)
+                    if w < TEMPLATE_MIN_SIZE or h < TEMPLATE_MIN_SIZE:
+                        continue
+                    if w > TEMPLATE_MAX_SIZE or h > TEMPLATE_MAX_SIZE:
+                        continue
+                    variants.append(cv2.resize(edges, (w, h), interpolation=cv2.INTER_AREA))
             if variants:
                 self.templates.append({"name": name, "variants": variants})
+                print(f"[OBJECTS] {name}: {len(variants)} variant(s), crop={image.shape[1]}x{image.shape[0]}")
         print(f"[OBJECTS] Loaded {len(self.templates)} object template(s)")
+
+    def _crop_template_object(self, image):
+        h, w = image.shape[:2]
+        hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+        border = np.concatenate([
+            image[:max(3, h // 20), :, :].reshape(-1, 3),
+            image[-max(3, h // 20):, :, :].reshape(-1, 3),
+            image[:, :max(3, w // 20), :].reshape(-1, 3),
+            image[:, -max(3, w // 20):, :].reshape(-1, 3),
+        ])
+        bg = np.median(border, axis=0).astype(np.float32)
+        dist = np.linalg.norm(image.astype(np.float32) - bg, axis=2)
+        sat = hsv[:, :, 1]
+        val = hsv[:, :, 2]
+        mask = np.zeros((h, w), dtype=np.uint8)
+        mask[(dist > 35) | (sat > 70) | (val < 90)] = 255
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((9, 9), np.uint8))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((21, 21), np.uint8))
+
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            return image
+
+        cx_img, cy_img = w / 2, h / 2
+        def score(c):
+            area = cv2.contourArea(c)
+            x, y, bw, bh = cv2.boundingRect(c)
+            cx, cy = x + bw / 2, y + bh / 2
+            center_penalty = np.hypot(cx - cx_img, cy - cy_img)
+            return area - center_penalty * 2
+
+        c = max(contours, key=score)
+        x, y, bw, bh = cv2.boundingRect(c)
+        pad = int(max(bw, bh) * 0.18)
+        x0 = max(0, x - pad)
+        y0 = max(0, y - pad)
+        x1 = min(w, x + bw + pad)
+        y1 = min(h, y + bh + pad)
+        if (x1 - x0) < 20 or (y1 - y0) < 20:
+            return image
+        return image[y0:y1, x0:x1]
+
+    def _rotate_bound(self, image, angle):
+        if angle == 0:
+            return image
+        h, w = image.shape[:2]
+        center = (w / 2, h / 2)
+        matrix = cv2.getRotationMatrix2D(center, angle, 1.0)
+        cos = abs(matrix[0, 0])
+        sin = abs(matrix[0, 1])
+        new_w = int((h * sin) + (w * cos))
+        new_h = int((h * cos) + (w * sin))
+        matrix[0, 2] += (new_w / 2) - center[0]
+        matrix[1, 2] += (new_h / 2) - center[1]
+        return cv2.warpAffine(image, matrix, (new_w, new_h), borderValue=255)
 
     def detect(self, frame, region=None):
         if not self.templates:
@@ -516,6 +612,7 @@ class TemplateObjectDetector:
         edges = cv2.Canny(gray, 50, 150)
 
         matches_found = []
+        best_debug = []
         for template in self.templates:
             best = None
             for tmpl in template["variants"]:
@@ -526,6 +623,8 @@ class TemplateObjectDetector:
                 _, score, _, loc = cv2.minMaxLoc(result)
                 if best is None or score > best["score"]:
                     best = {"score": score, "loc": loc, "size": (tw, th)}
+            if best is not None:
+                best_debug.append((template["name"], best["score"]))
             if best and best["score"] >= TEMPLATE_MATCH_THRESHOLD:
                 x, y = best["loc"]
                 tw, th = best["size"]
@@ -535,6 +634,9 @@ class TemplateObjectDetector:
                 matches_found.append((cx, cy, template["name"], best["score"], route, (x1 + x, y1 + y, tw, th)))
 
         matches_found.sort(key=lambda item: item[3], reverse=True)
+        if not matches_found and best_debug:
+            debug = ", ".join(f"{name}:{score:.2f}" for name, score in sorted(best_debug, key=lambda x: x[1], reverse=True)[:3])
+            print(f"[OBJECTS] No template above {TEMPLATE_MATCH_THRESHOLD:.2f}. Best: {debug}")
         return self._suppress_overlaps(matches_found)
 
     def _suppress_overlaps(self, detections):
@@ -546,7 +648,96 @@ class TemplateObjectDetector:
         return kept
 
 
-template_detector = TemplateObjectDetector()
+template_detector = TemplateObjectDetector() if USE_TEMPLATE_OBJECT_DETECTION else None
+
+
+class GenericObjectDetector:
+    """Detect a solid newly placed object in the placement zone."""
+
+    def __init__(self):
+        self.background_gray = None
+        self.background_lab = None
+        self.frames = 0
+
+    def detect(self, frame):
+        zone = frame[PZ_Y1:PZ_Y2, PZ_X1:PZ_X2]
+        gray = cv2.cvtColor(zone, cv2.COLOR_BGR2GRAY)
+        gray = cv2.GaussianBlur(gray, (15, 15), 0)
+        lab = cv2.cvtColor(zone, cv2.COLOR_BGR2LAB)
+        lab = cv2.GaussianBlur(lab, (11, 11), 0)
+
+        if self.background_gray is None:
+            self.background_gray = gray.astype("float")
+            self.background_lab = lab.astype("float")
+            return []
+
+        self.frames += 1
+        if self.frames <= GENERIC_WARMUP_FRAMES:
+            cv2.accumulateWeighted(gray, self.background_gray, 0.08)
+            cv2.accumulateWeighted(lab, self.background_lab, 0.08)
+            return []
+
+        gray_delta = cv2.absdiff(gray, cv2.convertScaleAbs(self.background_gray))
+        lab_delta = lab.astype(np.float32) - cv2.convertScaleAbs(self.background_lab).astype(np.float32)
+        color_delta = np.linalg.norm(lab_delta, axis=2).astype(np.uint8)
+        gray_mask = cv2.threshold(gray_delta, GENERIC_GRAY_DIFF_THRESHOLD, 255, cv2.THRESH_BINARY)[1]
+        color_mask = cv2.threshold(color_delta, GENERIC_COLOR_DIFF_THRESHOLD, 255, cv2.THRESH_BINARY)[1]
+        mask = cv2.bitwise_or(gray_mask, color_mask)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((9, 9), np.uint8))
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        candidates = []
+        for c in contours:
+            area = cv2.contourArea(c)
+            if area < GENERIC_MIN_AREA:
+                continue
+            x, y, w, h = cv2.boundingRect(c)
+            if w < GENERIC_MIN_BOX_WIDTH or h < GENERIC_MIN_BOX_HEIGHT:
+                continue
+            if (
+                x <= GENERIC_BORDER_MARGIN or y <= GENERIC_BORDER_MARGIN or
+                x + w >= mask.shape[1] - GENERIC_BORDER_MARGIN or
+                y + h >= mask.shape[0] - GENERIC_BORDER_MARGIN
+            ):
+                continue
+            aspect = max(w / max(1, h), h / max(1, w))
+            if aspect > GENERIC_MAX_ASPECT_RATIO:
+                continue
+            fill_ratio = area / max(1, w * h)
+            if fill_ratio < GENERIC_MIN_FILL_RATIO:
+                continue
+            M = cv2.moments(c)
+            if M["m00"]:
+                cx = PZ_X1 + int(M["m10"] / M["m00"])
+                cy = PZ_Y1 + int(M["m01"] / M["m00"])
+            else:
+                cx = PZ_X1 + x + w // 2
+                cy = PZ_Y1 + y + h // 2
+            candidates.append((cx, cy, GENERIC_OBJECT_NAME, GENERIC_DROP_KEY, area, (PZ_X1 + x, PZ_Y1 + y, w, h)))
+
+        if GENERIC_DEBUG_OBJECT_MASK:
+            cv2.imshow("Generic Object Mask", mask)
+        if not candidates:
+            cv2.accumulateWeighted(gray, self.background_gray, 0.03)
+            cv2.accumulateWeighted(lab, self.background_lab, 0.03)
+            return []
+
+        candidates.sort(key=lambda item: item[4], reverse=True)
+        return candidates[:MAX_OBJECTS_PER_FRAME]
+
+    def reset(self):
+        self.background_gray = None
+        self.background_lab = None
+        self.frames = 0
+
+    def forget_region(self, box):
+        # Force a short relearn after a pick/place cycle so removed objects do
+        # not remain as "negative" background-difference detections.
+        self.reset()
+
+
+generic_detector = GenericObjectDetector()
 
 
 def mask_for_colour(hsv, ranges):
@@ -588,6 +779,10 @@ def detect_coloured_blocks(frame):
 
 
 def detect_pickable_objects(frame):
+    """Detect one newly placed object, without shape/template sorting."""
+    if not USE_TEMPLATE_OBJECT_DETECTION:
+        return generic_detector.detect(frame)
+
     """Use templates first, then colour fallback for older tag-style parts."""
     objects = []
     for cx, cy, name, score, route, box in template_detector.detect(frame):
@@ -672,7 +867,18 @@ class WorkZoneSafetyMonitor:
         _, mask = cv2.threshold(delta, 24, 255, cv2.THRESH_BINARY)
         mask = cv2.dilate(mask, None, iterations=2)
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        moving = [c for c in contours if cv2.contourArea(c) >= MOTION_MIN_AREA]
+        moving = []
+        for c in contours:
+            area = cv2.contourArea(c)
+            if area < MOTION_MIN_AREA:
+                continue
+            x, y, w, h = cv2.boundingRect(c)
+            fill_ratio = area / max(1, w * h)
+            if w < MOTION_MIN_BOX_WIDTH or h < MOTION_MIN_BOX_HEIGHT:
+                continue
+            if fill_ratio < MOTION_MIN_FILL_RATIO:
+                continue
+            moving.append(c)
 
         if moving:
             self.motion_hits += 1
@@ -682,7 +888,7 @@ class WorkZoneSafetyMonitor:
             return self.motion_hits >= MOTION_BLOCK_FRAMES, box
 
         self.motion_hits = 0
-        cv2.accumulateWeighted(gray, self.background, 0.02)
+        cv2.accumulateWeighted(gray, self.background, 0.04)
         return False, None
 
     def _detect_skin_like(self, frame):
@@ -695,7 +901,18 @@ class WorkZoneSafetyMonitor:
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8))
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        skin = [c for c in contours if cv2.contourArea(c) >= SKIN_MIN_AREA]
+        skin = []
+        for c in contours:
+            area = cv2.contourArea(c)
+            if area < SKIN_MIN_AREA:
+                continue
+            x, y, w, h = cv2.boundingRect(c)
+            fill_ratio = area / max(1, w * h)
+            if w < SKIN_MIN_BOX_WIDTH or h < SKIN_MIN_BOX_HEIGHT:
+                continue
+            if fill_ratio < SKIN_MIN_FILL_RATIO:
+                continue
+            skin.append(c)
         if not skin:
             return False, None
         largest = max(skin, key=cv2.contourArea)
@@ -706,7 +923,9 @@ class WorkZoneSafetyMonitor:
         moving, motion_box = self._detect_motion(frame)
         skin_like, skin_box = self._detect_skin_like(frame)
 
-        blocked = moving or skin_like
+        # Skin colour alone is too close to the wood table. It is only visual
+        # context now; blocking comes from real work-zone motion or MediaPipe.
+        blocked = moving
         reasons = []
         if moving:
             reasons.append("motion")
@@ -766,52 +985,54 @@ def draw_status_panel(display, state, speed, hand_blocked, pace, block_count, co
         cv2.putText(display, f"Avg pace: {pace:.1f}s", (10, 78),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 0), 2)
 
-    # Per-colour counts
-    y0 = 105
-    for i, (c, cnt) in enumerate(colour_counts.items()):
-        cv2.putText(display, f"{c}: {cnt}", (10, y0 + i * 20),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, COLOUR_BGR.get(c, (255, 255, 255)), 2)
+    cv2.putText(display, f"Picked: {block_count}", (10, 105),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2)
 
     # Placement zone rectangle
     cv2.rectangle(display, (PZ_X1, PZ_Y1), (PZ_X2, PZ_Y2), (0, 255, 0), 2)
     cv2.putText(display, "PLACEMENT ZONE", (PZ_X1, PZ_Y1 - 10),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
 
-    # Drop-zone legend (right side of screen)
-    lx, ly = 540, 145
-    zone_keys = set(COLOUR_HSV)
-    zone_keys.update(drop_zones)
-    for colour in sorted(zone_keys):
-        zone = drop_zones.get(colour)
-        cv2.circle(display, (lx, ly), 8, COLOUR_BGR.get(colour, (255, 255, 255)), -1)
-        if zone:
-            dx, dy = zone["robot"]
-            text = f"{colour} {zone.get('kind', 'zone')} ({dx:.0f},{dy:.0f})"
-        else:
-            text = f"{colour} zone: searching"
-        cv2.putText(display, text, (lx + 14, ly + 4),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, COLOUR_BGR.get(colour, (255, 255, 255)), 2)
-        ly += 22
-
-    for colour, zone in drop_zones.items():
-        px, py = zone["pixel"]
-        if px is None or py is None:
+    # One fixed drop location for the generic object flow.
+    visible_drop_zones = {
+        GENERIC_DROP_KEY: drop_zones[GENERIC_DROP_KEY]
+    } if GENERIC_DROP_KEY in drop_zones else {}
+    for colour, zone in visible_drop_zones.items():
+        dx, dy = zone["robot"]
+        try:
+            drop_px, drop_py = robot_to_pixel(dx, dy, H_matrix)
+            if 0 <= drop_px < display.shape[1] and 0 <= drop_py < display.shape[0]:
+                cv2.drawMarker(display, (drop_px, drop_py), (255, 255, 255),
+                               markerType=cv2.MARKER_CROSS, markerSize=28, thickness=2)
+                cv2.circle(display, (drop_px, drop_py), 14, (255, 255, 255), 2)
+                cv2.putText(display, "DROP", (drop_px + 14, drop_py - 10),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 2)
+        except Exception:
+            pass
+        pixel = zone.get("pixel")
+        if pixel is None:
             continue
-        cv2.circle(display, (px, py), 14, COLOUR_BGR.get(colour, (255, 255, 255)), 2)
-        cv2.putText(display, f"{colour} drop", (px + 12, py),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, COLOUR_BGR.get(colour, (255, 255, 255)), 2)
+        px, py = pixel
+        cv2.circle(display, (px, py), 14, (255, 255, 255), 2)
+        cv2.putText(display, "DROP", (px + 12, py),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 2)
 
 
-def draw_detected_objects(display, objects):
-    for cx, cy, name, route, score, box in objects:
+def draw_detected_objects(display, objects, active=None):
+    items = []
+    if active is not None:
+        items = [active]
+    elif objects:
+        items = objects[:1]
+
+    for cx, cy, name, route, score, box in items:
         color = COLOUR_BGR.get(route, (255, 255, 255))
         if box:
             x, y, w, h = box
             cv2.rectangle(display, (x, y), (x + w, y + h), color, 2)
         cv2.circle(display, (cx, cy), 8, color, -1)
-        label = f"{name}->{route}" if route else f"{name}: no route"
-        cv2.putText(display, f"{label} {score:.2f}", (cx + 10, cy),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.42, color, 2)
+        cv2.putText(display, "TARGET", (cx + 10, cy),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 2)
 
 
 def draw_face_expression(display, mood, x=10, y=100, size=35):
@@ -864,6 +1085,17 @@ def matches(block, block_list):
     return False
 
 
+def landmarks_center_in_work_zone(landmarks, frame_shape):
+    if not landmarks:
+        return False
+    h, w = frame_shape[:2]
+    xs = [lm.x * w for lm in landmarks]
+    ys = [lm.y * h for lm in landmarks]
+    cx = sum(xs) / len(xs)
+    cy = sum(ys) / len(ys)
+    return PZ_X1 <= cx <= PZ_X2 and PZ_Y1 <= cy <= PZ_Y2
+
+
 def main():
     """Entry point — runs the main camera + state-machine loop."""
 
@@ -891,6 +1123,7 @@ def main():
     target_pixel = None                                   # pixel XY of current target
     target_colour = None                                  # colour of current target
     target_route = None                                   # detected destination zone key
+    target_box = None                                     # camera box of current target
     last_pick_time = time.time()                          # when the last block was placed
     picked_ids = set()                                    # set of (px, py, colour) already picked
     hold_count = 0                                        # frames the current block has been stable
@@ -913,13 +1146,22 @@ def main():
         if safety is not None:
             try:
                 hand_landmarks, handedness = safety.detect(frame)
-                hand_blocked = len(hand_landmarks) > 0
+                filtered_landmarks = []
+                filtered_handedness = []
+                for idx, landmarks in enumerate(hand_landmarks):
+                    if landmarks_center_in_work_zone(landmarks, frame.shape):
+                        filtered_landmarks.append(landmarks)
+                        if idx < len(handedness):
+                            filtered_handedness.append(handedness[idx])
+                hand_blocked = len(filtered_landmarks) > 0
                 if hand_blocked:
                     safety_reasons.append("hand")
-                    safety.draw_landmarks(display, hand_landmarks, handedness)
+                    safety.draw_landmarks(display, filtered_landmarks, filtered_handedness)
             except Exception as e:
                 print(f"[WARN] Hand safety detection failed: {e}")
-        work_zone_blocked = work_zone_safety.update(frame, display)
+        work_zone_blocked = False
+        if ENABLE_MOTION_SAFETY:
+            work_zone_blocked = work_zone_safety.update(frame, display)
         if work_zone_blocked:
             safety_reasons.append(work_zone_safety.last_reason or "work-zone")
         hand_blocked = hand_blocked or work_zone_blocked
@@ -937,16 +1179,13 @@ def main():
                           sum(intervals) / len(intervals) if intervals else None,
                           block_count, colour_counts, drop_zones)
 
-        # Highlight unpicked blocks with colour circles
-        draw_detected_objects(display, unpicked)
+        # Highlight only the active/next target to keep the preview readable.
+        draw_detected_objects(display, unpicked, active_block)
+        if not unpicked and generic_detector.frames < GENERIC_WARMUP_FRAMES:
+            cv2.putText(display, "Learning empty zone - keep clear",
+                        (PZ_X1 + 20, PZ_Y1 + 35),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 255), 2)
 
-        # Grey out already-picked blocks
-        for bx, by, bc, *_ in zone_objects:
-            if matches((bx, by, bc), picked_ids):
-                cv2.circle(display, (bx, by), 6, (100, 100, 100), -1)
-
-        cv2.putText(display, f"Unpicked: {len(unpicked)}  Zone: {len(zone_objects)}",
-                    (10, 420), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
         if safety_reasons:
             cv2.putText(display, f"Blocked: {','.join(safety_reasons)}",
                         (10, 445), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 255), 2)
@@ -957,6 +1196,9 @@ def main():
             break
         if key == ord('r'):
             picked_ids.clear()
+            generic_detector.reset()
+            active_block = None
+            hold_count = 0
             print("[RESET] Cleared picked-block memory")
 
         # ── Enforce minimum 2-second gap between pick cycles ──
@@ -1026,19 +1268,16 @@ def main():
                 target_pixel = active_block[:2]
                 target_colour = active_block[2]
                 target_route = active_block[3]
-                if target_route is None:
-                    print(f"[WAIT] {target_colour} detected, but no route exists in {OBJECT_ROUTE_FILE}")
-                    active_block = None
-                    hold_count = 0
-                    cv2.imshow(WINDOW_NAME, display)
-                    continue
+                target_box = active_block[5] if len(active_block) > 5 else None
                 if target_route not in drop_zones:
-                    print(f"[WAIT] No {target_route} drop zone detected yet for {target_colour}")
+                    print(f"[WAIT] No fixed drop coordinate for {target_route}")
                     active_block = None
                     hold_count = 0
                     cv2.imshow(WINDOW_NAME, display)
                     continue
                 rx, ry = pixel_to_robot(target_pixel[0], target_pixel[1], H_matrix)
+                rx += PICK_X_OFFSET_MM
+                ry += PICK_Y_OFFSET_MM
                 if not is_robot_xy_safe(rx, ry):
                     print(f"[BLOCKED] Target maps outside robot workspace: ({rx:.1f}, {ry:.1f})")
                     active_block = None
@@ -1066,6 +1305,11 @@ def main():
             if not safe_move_to_xyz(api, rx, ry, Z_PICK):
                 state = "watching"
                 continue
+
+            print("[GRIPPER] Closing...")
+            dobotArm.close_gripper(api)
+            state = "place_move" if safe_move_to_xyz(api, rx, ry, Z_SAFE) else "watching"
+            continue
 
             # Try closing gripper and verify by raising and re-checking presence visually.
             success = False
@@ -1152,9 +1396,17 @@ def main():
         # ── PLACE: Open gripper (release block), record stats ──
         elif state == "place_drop":
             dx, dy = drop_zones[target_route]["robot"]
+            print(f"[PLACE LOWER] ({dx:.1f}, {dy:.1f}, Z={Z_PICK})")
+            if not safe_move_to_xyz(api, dx, dy, Z_PICK):
+                state = "watching"
+                continue
+
             dobotArm.open_gripper(api)
             dobotArm.stop_pump(api)
             print(f"[DROP] released at ({dx:.1f}, {dy:.1f})")
+            if not safe_move_to_xyz(api, dx, dy, Z_SAFE):
+                state = "watching"
+                continue
 
             # Record the time interval since the last pick
             now = time.time()
@@ -1171,8 +1423,8 @@ def main():
                 active_block = None
                 hold_count = 0
             print(f"[PLACE] #{colour_counts[target_route]} {target_colour} delivered to {target_route}")
-            state = "place_rotate"
-            print(f"[STATE] → place_rotate")
+            state = "return_xy"
+            print("[STATE] -> return_xy")
 
         # ── PLACE: Rotate wrist back to 0° (neutral) ──
         elif state == "place_rotate":
@@ -1186,6 +1438,13 @@ def main():
             pace = sum(intervals) / len(intervals) if intervals else None
             print(f"[READY] Pace: {pace:.1f}s" if pace else "[READY]")
             print()
+            active_block = None
+            target_robot = None
+            target_pixel = None
+            target_colour = None
+            target_route = None
+            target_box = None
+            hold_count = 0
             state = "watching"
 
         # ── Show the annotated camera frame ──

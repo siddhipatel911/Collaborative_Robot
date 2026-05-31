@@ -1,4 +1,5 @@
 {
+  "generic": [260, 0],
   "redstrip": [260, -120],
   "pinkblock": [260, -80],
   "purpleblock": [260, -40],
