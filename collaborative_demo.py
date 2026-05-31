@@ -47,6 +47,15 @@ import cv2
 import time
 from collections import deque
 import os
+import json
+
+try:
+    from hand_safety import HandSafety
+    HAND_SAFETY_AVAILABLE = True
+except Exception as e:
+    HandSafety = None
+    HAND_SAFETY_AVAILABLE = False
+    print(f"[WARN] hand safety unavailable: {e}")
 
 
 # ══════════════════════════ MEDIAPIPE SETUP ══════════════════════════
@@ -75,14 +84,6 @@ Z_PICK = -25    # height to descend to when gripping a block (below the table su
 # Where the robot waits between pick cycles.
 READY_X, READY_Y = 180, 0
 
-# -- Drop-zone coordinates per colour (mm, robot XY) --
-# After picking, the robot carries the block to the matching drop zone and
-# releases the gripper. These are all at Z_SAFE height.
-DROP_RED   = (260, 80)
-DROP_GREEN = (260, 40)
-DROP_BLUE  = (260, 0)
-DROP_ZONES = {"red": DROP_RED, "green": DROP_GREEN, "blue": DROP_BLUE}
-
 # -- BGR colour values for on-screen drawing --
 COLOUR_BGR = {
     "red":   (0, 0, 255),
@@ -96,6 +97,7 @@ COLOUR_BGR = {
 PZ_X1, PZ_Y1 = 50, 20   # top-left corner
 PZ_X2, PZ_Y2 = 650, 315   # bottom-right corner
 WINDOW_NAME = "Collaborative Robot Demo"
+HSV_CONFIG_FILE = "hsv_ranges.json"
 
 # -- Speed adaptation --
 SPEED_WINDOW = 5      # number of recent pick intervals to average
@@ -105,20 +107,48 @@ MIN_SPEED    = 25     # never go below this
 FAST_PACE_S  = 3.0    # if avg interval < this, robot speeds up
 SLOW_PACE_S  = 8.0    # if avg interval > this, robot slows down
 
-# -- Mood modifiers (multiplied against pace-based speed) --
-MOOD_MODIFIERS = {
-    "happy":    1.0,
-    "focused":  1.0,
-    "neutral":  0.9,
-    "tired":    0.7,
-    "agitated": 0.5,
-    "no_face":  1.0,
-}
-
 HOLD_FRAMES = 8
 PICK_PROXIMITY_PX = 30  # blocks within this many pixels are considered the same
 PICK_RETRY_COUNT = 2
 PICK_RAISE_CHECK = -15  # raise to this Z to perform a quick pickup check
+MIN_BLOCK_AREA = 400
+MIN_DROP_ZONE_AREA = 1200
+DROP_ZONE_SCAN_INTERVAL = 0.5
+MOTION_MIN_AREA = 1800
+MOTION_WARMUP_FRAMES = 20
+MOTION_BLOCK_FRAMES = 2
+SKIN_MIN_AREA = 1800
+SAFETY_ZONE_MARGIN = 25
+
+# Movement limits keep bad camera calibration from sending impossible moves.
+# Recalibrate if a valid table point lands outside this box.
+ROBOT_X_RANGE = (120, 320)
+ROBOT_Y_RANGE = (-140, 140)
+ROBOT_Z_RANGE = (-35, 120)
+
+DEFAULT_COLOUR_HSV = {
+    "red": [
+        [[0, 120, 70], [10, 255, 255]],
+        [[170, 120, 70], [180, 255, 255]],
+    ],
+    "green": [
+        [[40, 80, 70], [80, 255, 255]],
+    ],
+    "blue": [
+        [[90, 80, 70], [130, 255, 255]],
+    ],
+}
+
+# Kept only so the old MoodAnalyzer helper remains import-safe; main() no longer
+# uses face mood to change robot speed.
+MOOD_MODIFIERS = {
+    "happy": 1.0,
+    "focused": 1.0,
+    "neutral": 1.0,
+    "tired": 1.0,
+    "agitated": 1.0,
+    "no_face": 1.0,
+}
 
 
 # ══════════════════════════ MOOD ANALYSER ══════════════════════════
@@ -260,18 +290,32 @@ class MoodAnalyzer:
 
 
 # ══════════════════════════ CAMERA SETUP ══════════════════════════
-# Open the Orbbec camera (index 1, with fallback to index 0).
+# Open the Orbbec camera (prefer index 1, with tested fallback).
 # Then load the pre-computed calibration files and build the undistortion map.
 
+def find_camera(max_index=6, preferred_index=1):
+    """Find a readable camera, matching calibrateCamera.py's preview behavior."""
+    available = []
+    for idx in range(max_index):
+        test_cap = cv2.VideoCapture(idx, cv2.CAP_DSHOW)
+        if test_cap.isOpened():
+            ret, test_frame = test_cap.read()
+            if ret and test_frame is not None:
+                available.append(idx)
+        test_cap.release()
+
+    if not available:
+        return None, None
+
+    selected = preferred_index if preferred_index in available else available[0]
+    return cv2.VideoCapture(selected, cv2.CAP_DSHOW), selected
+
 api = dType.load()                                              # load Dobot DLL first
-cap = cv2.VideoCapture(1, cv2.CAP_DSHOW)                        # try camera index 1
-if not cap.isOpened():
-    print("[WARN] Camera index 1 failed, trying index 0...")
-    cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)                    # fallback to index 0
-if not cap.isOpened():
+cap, CAMERA_INDEX = find_camera()
+if cap is None or not cap.isOpened():
     print("[FATAL] No camera found")
     exit(1)
-print(f"[CAMERA] Opened")
+print(f"[CAMERA] Opened index {CAMERA_INDEX}")
 
 H_matrix = np.load("HomographyMatrix.npy")                      # 3×3 homography: pixel → robot mm
 data = np.load("camera_params.npz")                             # camera intrinsics from calibration
@@ -313,42 +357,236 @@ def pixel_to_robot(u, v, H):
     return xy[0], xy[1]
 
 
-# -- HSV colour ranges for block detection --
-# Each colour can have multiple ranges (red wraps around the HSV hue axis).
-# Format: (lower_bound, upper_bound)  as (H, S, V) tuples.
-COLOUR_HSV = {
-    "red":   ([(0, 120, 70), (10, 255, 255)], [(170, 120, 70), (180, 255, 255)]),
-    "green": ([(40, 80, 70), (80, 255, 255)],),
-    "blue":  ([(90, 80, 70), (130, 255, 255)],),
-}
+def normalise_hsv_ranges(raw):
+    """Accept the current JSON shape and the older single-colour shape."""
+    if isinstance(raw, dict) and "colors" in raw:
+        raw = raw["colors"]
+    elif isinstance(raw, dict) and "ranges" in raw:
+        raw = {"red": raw["ranges"]}
+
+    ranges = {}
+    if not isinstance(raw, dict):
+        return DEFAULT_COLOUR_HSV.copy()
+
+    for colour, value in raw.items():
+        if isinstance(value, dict):
+            value = value.get("ranges", [])
+        clean = []
+        for item in value:
+            if len(item) != 2:
+                continue
+            lower = [int(max(0, min(255, x))) for x in item[0]]
+            upper = [int(max(0, min(255, x))) for x in item[1]]
+            if len(lower) == 3 and len(upper) == 3:
+                clean.append([lower, upper])
+        if clean:
+            ranges[colour] = clean
+
+    return ranges or DEFAULT_COLOUR_HSV.copy()
 
 
-def detect_coloured_blocks(frame):
-    """Find coloured blocks in the camera frame.
+def load_colour_hsv(path=HSV_CONFIG_FILE):
+    if not os.path.exists(path):
+        return DEFAULT_COLOUR_HSV.copy()
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            loaded = normalise_hsv_ranges(json.load(f))
+        for colour in loaded:
+            COLOUR_BGR.setdefault(colour, (255, 255, 255))
+        return loaded
+    except Exception as e:
+        print(f"[WARN] Failed to load {path}: {e}; using defaults")
+        return DEFAULT_COLOUR_HSV.copy()
 
-    Returns a list of (cx, cy, colour) tuples where (cx, cy) is the
-    centroid in pixel coordinates.
-    """
+
+COLOUR_HSV = load_colour_hsv()
+
+
+def mask_for_colour(hsv, ranges):
+    mask = np.zeros(hsv.shape[:2], dtype=np.uint8)
+    for lower, upper in ranges:
+        mask = cv2.bitwise_or(
+            mask,
+            cv2.inRange(hsv, np.array(lower, dtype=np.uint8), np.array(upper, dtype=np.uint8)),
+        )
+    return cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
+
+
+def detect_coloured_objects(frame, min_area):
+    """Find configured colours and return (cx, cy, colour, area)."""
     hsv = cv2.cvtColor(cv2.GaussianBlur(frame, (3, 3), 0), cv2.COLOR_BGR2HSV)
-    blocks = []
+    objects = []
     for colour, ranges in COLOUR_HSV.items():
-        # Build a mask for this colour (union of all its HSV ranges)
-        mask = cv2.inRange(hsv, np.array(ranges[0][0]), np.array(ranges[0][1]))
-        if len(ranges) > 1:
-            mask += cv2.inRange(hsv, np.array(ranges[1][0]), np.array(ranges[1][1]))
-
-        # Clean up the mask: close small holes, then find contours
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
+        mask = mask_for_colour(hsv, ranges)
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
         for c in contours:
-            if cv2.contourArea(c) > 400:          # ignore tiny blobs (noise)
+            area = cv2.contourArea(c)
+            if area > min_area:
                 M = cv2.moments(c)
                 if M["m00"]:
                     cx = int(M["m10"] / M["m00"])
                     cy = int(M["m01"] / M["m00"])
-                    blocks.append((cx, cy, colour))
+                    objects.append((cx, cy, colour, area))
+    return objects
+
+
+def detect_coloured_blocks(frame):
+    """Find pickable coloured blocks in the placement zone."""
+    blocks = []
+    for cx, cy, colour, _ in detect_coloured_objects(frame, MIN_BLOCK_AREA):
+        if PZ_X1 <= cx <= PZ_X2 and PZ_Y1 <= cy <= PZ_Y2:
+            blocks.append((cx, cy, colour))
     return blocks
+
+
+def detect_drop_zones(frame):
+    """Detect the largest configured colour target outside the placement zone."""
+    zones = {}
+    for cx, cy, colour, area in detect_coloured_objects(frame, MIN_DROP_ZONE_AREA):
+        if PZ_X1 <= cx <= PZ_X2 and PZ_Y1 <= cy <= PZ_Y2:
+            continue
+        rx, ry = pixel_to_robot(cx, cy, H_matrix)
+        if not is_robot_xy_safe(rx, ry):
+            continue
+        current = zones.get(colour)
+        if current is None or area > current["area"]:
+            zones[colour] = {"pixel": (cx, cy), "robot": (rx, ry), "area": area}
+    return zones
+
+
+def is_robot_xy_safe(x, y):
+    return ROBOT_X_RANGE[0] <= x <= ROBOT_X_RANGE[1] and ROBOT_Y_RANGE[0] <= y <= ROBOT_Y_RANGE[1]
+
+
+def is_robot_xyz_safe(x, y, z):
+    return is_robot_xy_safe(x, y) and ROBOT_Z_RANGE[0] <= z <= ROBOT_Z_RANGE[1]
+
+
+def safe_move_to_xyz(api, x, y, z, rHead=0, wait=True):
+    if not is_robot_xyz_safe(x, y, z):
+        print(f"[BLOCKED] Refusing unsafe move ({x:.1f}, {y:.1f}, {z:.1f})")
+        return False
+    try:
+        result = dobotArm.move_to_xyz(api, x, y, z, rHead, wait)
+        if result != 0:
+            print(f"[ERROR] Dobot move returned {result}")
+            return False
+        return True
+    except Exception as e:
+        print(f"[ERROR] Dobot move failed: {e}")
+        return False
+
+
+def safe_rotate_end_effector(api, angle):
+    try:
+        result = dobotArm.rotate_end_effector(api, angle)
+        if result != 0:
+            print(f"[ERROR] Wrist rotation rejected: {angle}")
+            return False
+        return True
+    except Exception as e:
+        print(f"[ERROR] Wrist rotation failed: {e}")
+        return False
+
+
+class WorkZoneSafetyMonitor:
+    """Blocks when moving or skin-like objects enter the robot work zone."""
+
+    def __init__(self):
+        self.background = None
+        self.frame_count = 0
+        self.motion_hits = 0
+        self.last_reason = ""
+
+    def _zone(self, frame):
+        h, w = frame.shape[:2]
+        x1 = max(0, PZ_X1 - SAFETY_ZONE_MARGIN)
+        y1 = max(0, PZ_Y1 - SAFETY_ZONE_MARGIN)
+        x2 = min(w, PZ_X2 + SAFETY_ZONE_MARGIN)
+        y2 = min(h, PZ_Y2 + SAFETY_ZONE_MARGIN)
+        return x1, y1, x2, y2
+
+    def _detect_motion(self, frame):
+        x1, y1, x2, y2 = self._zone(frame)
+        roi = frame[y1:y2, x1:x2]
+        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+        gray = cv2.GaussianBlur(gray, (21, 21), 0)
+
+        if self.background is None:
+            self.background = gray.astype("float")
+            return False, None
+
+        self.frame_count += 1
+        if self.frame_count <= MOTION_WARMUP_FRAMES:
+            cv2.accumulateWeighted(gray, self.background, 0.08)
+            return False, None
+
+        delta = cv2.absdiff(gray, cv2.convertScaleAbs(self.background))
+        _, mask = cv2.threshold(delta, 24, 255, cv2.THRESH_BINARY)
+        mask = cv2.dilate(mask, None, iterations=2)
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        moving = [c for c in contours if cv2.contourArea(c) >= MOTION_MIN_AREA]
+
+        if moving:
+            self.motion_hits += 1
+            largest = max(moving, key=cv2.contourArea)
+            x, y, w, h = cv2.boundingRect(largest)
+            box = (x + x1, y + y1, w, h)
+            return self.motion_hits >= MOTION_BLOCK_FRAMES, box
+
+        self.motion_hits = 0
+        cv2.accumulateWeighted(gray, self.background, 0.02)
+        return False, None
+
+    def _detect_skin_like(self, frame):
+        x1, y1, x2, y2 = self._zone(frame)
+        roi = frame[y1:y2, x1:x2]
+        ycrcb = cv2.cvtColor(roi, cv2.COLOR_BGR2YCrCb)
+        lower = np.array([0, 133, 77], dtype=np.uint8)
+        upper = np.array([255, 173, 127], dtype=np.uint8)
+        mask = cv2.inRange(ycrcb, lower, upper)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8))
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        skin = [c for c in contours if cv2.contourArea(c) >= SKIN_MIN_AREA]
+        if not skin:
+            return False, None
+        largest = max(skin, key=cv2.contourArea)
+        x, y, w, h = cv2.boundingRect(largest)
+        return True, (x + x1, y + y1, w, h)
+
+    def update(self, frame, display):
+        moving, motion_box = self._detect_motion(frame)
+        skin_like, skin_box = self._detect_skin_like(frame)
+
+        blocked = moving or skin_like
+        reasons = []
+        if moving:
+            reasons.append("motion")
+            x, y, w, h = motion_box
+            cv2.rectangle(display, (x, y), (x + w, y + h), (0, 165, 255), 2)
+        if skin_like:
+            reasons.append("skin")
+            x, y, w, h = skin_box
+            cv2.rectangle(display, (x, y), (x + w, y + h), (0, 0, 255), 2)
+
+        self.last_reason = "+".join(reasons)
+        return blocked
+
+
+def warn_if_homography_needs_recalibration():
+    corners = [(PZ_X1, PZ_Y1), (PZ_X2, PZ_Y1), (PZ_X1, PZ_Y2), (PZ_X2, PZ_Y2)]
+    unsafe = []
+    for u, v in corners:
+        rx, ry = pixel_to_robot(u, v, H_matrix)
+        if not is_robot_xy_safe(rx, ry):
+            unsafe.append((u, v, rx, ry))
+    if unsafe:
+        print("[WARN] Placement zone extends outside the calibrated robot workspace.")
+        print("[WARN] Run getTransformationMatrix.py before the demo with the current camera/table setup.")
+        for u, v, rx, ry in unsafe:
+            print(f"       pixel ({u},{v}) -> robot ({rx:.1f},{ry:.1f})")
 
 
 def compute_pace_speed(intervals):
@@ -370,12 +608,14 @@ def compute_pace_speed(intervals):
 
 # ══════════════════════════ DRAWING HELPERS ══════════════════════════
 
-def draw_status_panel(display, state, speed, mood, pace, block_count, colour_counts):
+def draw_status_panel(display, state, speed, hand_blocked, pace, block_count, colour_counts, drop_zones):
     """Overlay status information on the camera feed."""
-    cv2.putText(display, f"Speed: {speed}%  Mood: {mood}", (10, 30),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 0), 2)
+    safety = "HAND BLOCK" if hand_blocked else "SAFE"
+    safety_color = (0, 0, 255) if hand_blocked else (0, 255, 0)
+    cv2.putText(display, f"Speed: {speed}%  Safety: {safety}", (10, 30),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.65, safety_color, 2)
     cv2.putText(display, f"State: {state}", (10, 55),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 0), 2)
+                cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 0), 2)
     if pace is not None:
         cv2.putText(display, f"Avg pace: {pace:.1f}s", (10, 78),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 0), 2)
@@ -393,11 +633,23 @@ def draw_status_panel(display, state, speed, mood, pace, block_count, colour_cou
 
     # Drop-zone legend (right side of screen)
     lx, ly = 540, 145
-    for colour, (dx, dy) in DROP_ZONES.items():
-        cv2.circle(display, (lx, ly), 8, COLOUR_BGR[colour], -1)
-        cv2.putText(display, f"{colour} ({dx},{dy})", (lx + 14, ly + 4),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, COLOUR_BGR[colour], 2)
+    for colour in sorted(COLOUR_HSV):
+        zone = drop_zones.get(colour)
+        cv2.circle(display, (lx, ly), 8, COLOUR_BGR.get(colour, (255, 255, 255)), -1)
+        if zone:
+            dx, dy = zone["robot"]
+            text = f"{colour} ({dx:.0f},{dy:.0f})"
+        else:
+            text = f"{colour} zone: searching"
+        cv2.putText(display, text, (lx + 14, ly + 4),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, COLOUR_BGR.get(colour, (255, 255, 255)), 2)
         ly += 22
+
+    for colour, zone in drop_zones.items():
+        px, py = zone["pixel"]
+        cv2.circle(display, (px, py), 14, COLOUR_BGR.get(colour, (255, 255, 255)), 2)
+        cv2.putText(display, f"{colour} drop", (px + 12, py),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, COLOUR_BGR.get(colour, (255, 255, 255)), 2)
 
 
 def draw_face_expression(display, mood, x=10, y=100, size=35):
@@ -452,17 +704,24 @@ def matches(block, block_list):
 def main():
     """Entry point — runs the main camera + state-machine loop."""
 
-    mood_analyzer = MoodAnalyzer()
-    frame_ts = int(time.perf_counter() * 1000)           # timestamp for MediaPipe video mode
+    safety = None
+    if HAND_SAFETY_AVAILABLE:
+        try:
+            safety = HandSafety()
+            print("[HAND SAFETY] Enabled")
+        except Exception as e:
+            print(f"[WARN] Hand safety disabled: {e}")
+    work_zone_safety = WorkZoneSafetyMonitor()
+    warn_if_homography_needs_recalibration()
 
     # Move robot to the ready position (blocks until done)
     dobotArm.set_speed(api, BASE_SPEED)
-    dobotArm.move_to_xyz(api, READY_X, READY_Y, Z_SAFE)
+    safe_move_to_xyz(api, READY_X, READY_Y, Z_SAFE)
     print("[SYSTEM] Ready. Waiting for human to place blocks in the zone...")
 
     # ── state variables ──
     intervals = deque(maxlen=SPEED_WINDOW)                # rolling window of pick-pace intervals
-    colour_counts = {"red": 0, "green": 0, "blue": 0}     # tally per colour
+    colour_counts = {colour: 0 for colour in COLOUR_HSV}  # tally per colour
     block_count = 0                                       # total blocks picked
     state = "watching"                                    # current state-machine state
     target_robot = None                                   # robot XY of current target (mm)
@@ -473,6 +732,8 @@ def main():
     hold_count = 0                                        # frames the current block has been stable
     active_block = None                                   # (px, py, colour) we're currently watching
     last_cycle_time = 0                                   # timestamp of last completed pick cycle
+    drop_zones = {}
+    last_drop_zone_scan = 0
 
     # ── main loop ──
     while True:
@@ -482,31 +743,46 @@ def main():
             continue
         frame = cv2.remap(frame, map1, map2, cv2.INTER_LINEAR)   # undistort
         display = frame.copy()
-        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)       # MediaPipe expects RGB
-        frame_ts += 33                                            # approximate ~30 fps
-
-        # ── Perception ──
-        mood = mood_analyzer.update(frame_rgb, frame_ts)          # detect face mood
+        # Perception
+        hand_blocked = False
+        safety_reasons = []
+        if safety is not None:
+            try:
+                hand_landmarks, handedness = safety.detect(frame)
+                hand_blocked = len(hand_landmarks) > 0
+                if hand_blocked:
+                    safety_reasons.append("hand")
+                    safety.draw_landmarks(display, hand_landmarks, handedness)
+            except Exception as e:
+                print(f"[WARN] Hand safety detection failed: {e}")
+        work_zone_blocked = work_zone_safety.update(frame, display)
+        if work_zone_blocked:
+            safety_reasons.append(work_zone_safety.last_reason or "work-zone")
+        hand_blocked = hand_blocked or work_zone_blocked
         blocks = detect_coloured_blocks(frame)                    # find all coloured blocks
         zone_blocks = [(x, y, c) for x, y, c in blocks
                        if PZ_X1 <= x <= PZ_X2 and PZ_Y1 <= y <= PZ_Y2]   # only those in zone
         unpicked = [b for b in zone_blocks if not matches(b, picked_ids)]  # minus already-picked
 
+        now = time.time()
+        if now - last_drop_zone_scan >= DROP_ZONE_SCAN_INTERVAL:
+            detected_zones = detect_drop_zones(frame)
+            if detected_zones:
+                drop_zones.update(detected_zones)
+            last_drop_zone_scan = now
+
         # ── Speed computation ──
-        pace_speed = compute_pace_speed(list(intervals))
-        modifier = mood_analyzer.current_modifier
-        effective_speed = max(MIN_SPEED, min(MAX_SPEED, int(pace_speed * modifier)))
+        effective_speed = compute_pace_speed(list(intervals))
         dobotArm.set_speed(api, effective_speed)
 
         # ── Drawing ──
-        draw_status_panel(display, state, effective_speed, mood,
+        draw_status_panel(display, state, effective_speed, hand_blocked,
                           sum(intervals) / len(intervals) if intervals else None,
-                          block_count, colour_counts)
-        draw_face_expression(display, mood)
+                          block_count, colour_counts, drop_zones)
 
         # Highlight unpicked blocks with colour circles
         for bx, by, bc in unpicked:
-            cv2.circle(display, (bx, by), 8, COLOUR_BGR[bc], -1)
+            cv2.circle(display, (bx, by), 8, COLOUR_BGR.get(bc, (255, 255, 255)), -1)
             cv2.circle(display, (bx, by), 8, (255, 255, 255), 1)
 
         # Grey out already-picked blocks
@@ -516,6 +792,9 @@ def main():
 
         cv2.putText(display, f"Unpicked: {len(unpicked)}  Zone: {len(zone_blocks)}",
                     (10, 420), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        if safety_reasons:
+            cv2.putText(display, f"Blocked: {','.join(safety_reasons)}",
+                        (10, 445), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 255), 2)
 
         # ── Key input ──
         key = cv2.waitKey(1) & 0xFF
@@ -528,7 +807,6 @@ def main():
         # ── Enforce minimum 2-second gap between pick cycles ──
         # Prevents the robot from immediately re-entering a cycle after
         # returning to ready (gives the human time to place another block).
-        now = time.time()
         if state not in ("watching", "pick_move", "pick_lower"):
             last_cycle_time = now
         if state == "watching" and now - last_cycle_time < 2.0:
@@ -539,9 +817,13 @@ def main():
         # Blocking — camera feed freezes during the move.
         if key == ord('m') and state == "watching":
             print("\n[TEST] Moving to test coordinate (200, 0, 40)...")
-            dobotArm.move_to_xyz(api, 200, 0, 40)
+            if hand_blocked:
+                print("[TEST] Blocked by hand safety")
+                cv2.imshow(WINDOW_NAME, display)
+                continue
+            safe_move_to_xyz(api, 200, 0, 40)
             print("[TEST] Returning to ready...")
-            dobotArm.move_to_xyz(api, READY_X, READY_Y, Z_SAFE)
+            safe_move_to_xyz(api, READY_X, READY_Y, Z_SAFE)
             print("[TEST] Done\n")
             cv2.imshow(WINDOW_NAME, display)
             continue
@@ -559,6 +841,12 @@ def main():
         # ── WATCHING ──
         # Look for a new block. Once a block is seen for HOLD_FRAMES
         # consecutive frames (debounce), commit to picking it.
+        if hand_blocked:
+            active_block = None
+            hold_count = 0
+            cv2.imshow(WINDOW_NAME, display)
+            continue
+
         if state == "watching":
             if not unpicked:
                 active_block = None
@@ -582,7 +870,19 @@ def main():
             if hold_count >= HOLD_FRAMES and active_block is not None:
                 target_pixel = active_block[:2]
                 target_colour = active_block[2]
+                if target_colour not in drop_zones:
+                    print(f"[WAIT] No {target_colour} drop zone detected yet")
+                    active_block = None
+                    hold_count = 0
+                    cv2.imshow(WINDOW_NAME, display)
+                    continue
                 rx, ry = pixel_to_robot(target_pixel[0], target_pixel[1], H_matrix)
+                if not is_robot_xy_safe(rx, ry):
+                    print(f"[BLOCKED] Target maps outside robot workspace: ({rx:.1f}, {ry:.1f})")
+                    active_block = None
+                    hold_count = 0
+                    cv2.imshow(WINDOW_NAME, display)
+                    continue
                 target_robot = (rx, ry)
                 print(f"\n[NEW {target_colour.upper()} BLOCK] "
                       f"px=({target_pixel[0]},{target_pixel[1]}) "
@@ -595,14 +895,15 @@ def main():
         elif state == "pick_move":
             rx, ry = target_robot
             print(f"[PICK MOVE] ({rx:.1f}, {ry:.1f}, Z={Z_SAFE})")
-            dobotArm.move_to_xyz(api, rx, ry, Z_SAFE)
-            state = "pick_lower"
+            state = "pick_lower" if safe_move_to_xyz(api, rx, ry, Z_SAFE) else "watching"
 
         # ── PICK: Lower to Z_PICK, then grip with verification & retries ──
         elif state == "pick_lower":
             rx, ry = target_robot
             print(f"[PICK LOWER] ({rx:.1f}, {ry:.1f}, Z={Z_PICK})")
-            dobotArm.move_to_xyz(api, rx, ry, Z_PICK)
+            if not safe_move_to_xyz(api, rx, ry, Z_PICK):
+                state = "watching"
+                continue
 
             # Try closing gripper and verify by raising and re-checking presence visually.
             success = False
@@ -610,7 +911,8 @@ def main():
                 print(f"[GRIPPER] Closing... (attempt {attempt+1})")
                 dobotArm.close_gripper(api)
                 # Raise slightly to clear surface for a quick check
-                dobotArm.move_to_xyz(api, rx, ry, PICK_RAISE_CHECK)
+                if not safe_move_to_xyz(api, rx, ry, PICK_RAISE_CHECK):
+                    break
 
                 # Minimal visual check: capture a frame and test if color still present near pixel
                 ret_chk, chk_frame = cap.read()
@@ -647,7 +949,8 @@ def main():
 
                 # if not successful, reopen and try again
                 dobotArm.open_gripper(api)
-                dobotArm.move_to_xyz(api, rx, ry, Z_PICK)
+                if not safe_move_to_xyz(api, rx, ry, Z_PICK):
+                    break
 
             if not success:
                 print("[ERROR] Failed to pick block after retries — skipping this block")
@@ -663,26 +966,30 @@ def main():
         elif state == "pick_rise":
             rx, ry = target_robot
             print(f"[PICK RISE] ({rx:.1f}, {ry:.1f}, Z={Z_SAFE})")
-            dobotArm.move_to_xyz(api, rx, ry, Z_SAFE)
-            state = "pick_rotate"
+            state = "pick_rotate" if safe_move_to_xyz(api, rx, ry, Z_SAFE) else "watching"
 
         # ── PICK: Rotate the wrist 90° to clear the camera view ──
         elif state == "pick_rotate":
             print(f"[PICK ROTATE] 90°")
-            dobotArm.rotate_end_effector(api, 90)
+            if not safe_rotate_end_effector(api, 90):
+                state = "watching"
+                continue
             print(f"[PICK] {target_colour} block done")
             state = "place_move"
 
         # ── PLACE: Move XY to the colour's drop zone ──
         elif state == "place_move":
-            dx, dy = DROP_ZONES[target_colour]
+            if target_colour not in drop_zones:
+                print(f"[WAIT] Lost {target_colour} drop zone; waiting for detection")
+                cv2.imshow(WINDOW_NAME, display)
+                continue
+            dx, dy = drop_zones[target_colour]["robot"]
             print(f"[PLACE MOVE] ({dx:.1f}, {dy:.1f}, Z={Z_SAFE})")
-            dobotArm.move_to_xyz(api, dx, dy, Z_SAFE)
-            state = "place_drop"
+            state = "place_drop" if safe_move_to_xyz(api, dx, dy, Z_SAFE) else "watching"
 
         # ── PLACE: Open gripper (release block), record stats ──
         elif state == "place_drop":
-            dx, dy = DROP_ZONES[target_colour]
+            dx, dy = drop_zones[target_colour]["robot"]
             dobotArm.open_gripper(api)
             dobotArm.stop_pump(api)
             print(f"[DROP] released at ({dx:.1f}, {dy:.1f})")
@@ -707,13 +1014,12 @@ def main():
         # ── PLACE: Rotate wrist back to 0° (neutral) ──
         elif state == "place_rotate":
             print(f"[PLACE ROTATE] 0°")
-            dobotArm.rotate_end_effector(api, 0)
-            state = "return_xy"
+            state = "return_xy" if safe_rotate_end_effector(api, 0) else "watching"
 
         # ── RETURN: Move back to the ready position ──
         elif state == "return_xy":
             print(f"[RETURN] ({READY_X}, {READY_Y}, Z={Z_SAFE})")
-            dobotArm.move_to_xyz(api, READY_X, READY_Y, Z_SAFE)
+            safe_move_to_xyz(api, READY_X, READY_Y, Z_SAFE)
             pace = sum(intervals) / len(intervals) if intervals else None
             print(f"[READY] Pace: {pace:.1f}s" if pace else "[READY]")
             print()

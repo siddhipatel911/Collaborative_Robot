@@ -96,7 +96,14 @@ def move_to_xyz(api, x, y, z, rHead=0, wait=True):
 
     Returns 0 on success (no error reporting for now).
     """
-    dType.SetPTPCmd(api, dType.PTPMode.PTPMOVJXYZMode, x, y, z, rHead, isQueued=0)
+    if not all(math.isfinite(v) for v in (x, y, z, rHead)):
+        print(f"Refusing invalid Dobot move: {(x, y, z, rHead)}")
+        return -1
+    try:
+        dType.SetPTPCmd(api, dType.PTPMode.PTPMOVJXYZMode, x, y, z, rHead, isQueued=0)
+    except Exception as e:
+        print(f"Dobot move failed: {e}")
+        return -1
     if wait:
         dType.dSleep(3000)
     return 0
@@ -138,9 +145,13 @@ def rotate_end_effector(api, angle, wait=True):
     Returns 0 on success, -1 if angle is out of range.
     """
     if 90 >= angle >= -90:
-        pose = dType.GetPose(api)
-        dType.SetPTPCmd(api, dType.PTPMode.PTPMOVLXYZMode,
-                        pose[0], pose[1], pose[2], angle, isQueued=0)
+        try:
+            pose = dType.GetPose(api)
+            dType.SetPTPCmd(api, dType.PTPMode.PTPMOVLXYZMode,
+                            pose[0], pose[1], pose[2], angle, isQueued=0)
+        except Exception as e:
+            print(f"Dobot wrist rotation failed: {e}")
+            return -1
         if wait:
             dType.dSleep(3000)
         return 0

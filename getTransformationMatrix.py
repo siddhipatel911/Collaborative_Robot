@@ -4,6 +4,7 @@ import time
 import numpy as np
 import cv2
 import os
+import json
 
 # Useful Global Variables
 CON_STR = {
@@ -12,14 +13,27 @@ CON_STR = {
     dType.DobotConnect.DobotConnect_Occupied: "DobotConnect_Occupied"
 }
 
-cam = cv2.VideoCapture(1, cv2.CAP_DSHOW)
-if not cam.isOpened():
-    print("[WARN] Camera index 1 failed, trying index 0...")
-    cam = cv2.VideoCapture(0, cv2.CAP_DSHOW)
+def find_camera(max_index=6, preferred_index=1):
+    available = []
+    for idx in range(max_index):
+        test = cv2.VideoCapture(idx, cv2.CAP_DSHOW)
+        if test.isOpened():
+            ret, frame = test.read()
+            if ret and frame is not None:
+                available.append(idx)
+        test.release()
+    if not available:
+        return None, None
+    selected = preferred_index if preferred_index in available else available[0]
+    return cv2.VideoCapture(selected, cv2.CAP_DSHOW), selected
 
-if not cam.isOpened():
+
+cam, camera_index = find_camera()
+
+if cam is None or not cam.isOpened():
     print("Camera failed to open")
     exit()
+print(f"[CAMERA] Using index {camera_index}")
     
 #if the program errors for file path problems, copy the relative path to camera_params.npz and paste it here and try again. 
 data = np.load("camera_params.npz")
@@ -28,6 +42,9 @@ dist_coeffs   = data["dist_coeffs"]
 
 # compute undistort maps once
 ret,frame = cam.read()
+if not ret:
+    print("Camera opened but failed to read a frame")
+    exit()
 h,w = frame.shape[:2]
 
 new_K, roi = cv2.getOptimalNewCameraMatrix(
@@ -48,59 +65,75 @@ map1, map2 = cv2.initUndistortRectifyMap(
 
 api = dType.load()
 
+
+def load_red_ranges():
+    default = [
+        ([0, 90, 60], [12, 255, 255]),
+        ([165, 90, 60], [180, 255, 255]),
+    ]
+    path = "hsv_ranges.json"
+    if not os.path.exists(path):
+        return default
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        colors = data.get("colors", {})
+        red = colors.get("red")
+        if not red:
+            return default
+        return [(item[0], item[1]) for item in red if len(item) == 2]
+    except Exception:
+        return default
+
 # robot coordinates in mm
 robot_points = np.array([
-    [200,-80],
-    [230,-80],
-    [260,-80],
-
-    [200,-40],
-    [230,-40],
-    [260,-40],
-
-    [200,0],
-    [230,0],
-    [260,0],
-
-    [200,40],
-    [230,40],
-    [260,40]
+    [160, -120], [200, -120], [240, -120], [280, -120],
+    [160,  -60], [200,  -60], [240,  -60], [280,  -60],
+    [160,    0], [200,    0], [240,    0], [280,    0],
+    [160,   60], [200,   60], [240,   60], [280,   60],
+    [160,  120], [200,  120], [240,  120], [280,  120],
 ], dtype=np.float32)
+
+
+RED_RANGES = load_red_ranges()
 
 
 def detect_red_center(frame):
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
 
-    lower1 = np.array([0,120,70])
-    upper1 = np.array([10,255,255])
+    mask = np.zeros(hsv.shape[:2], dtype=np.uint8)
+    for lower, upper in RED_RANGES:
+        mask = cv2.bitwise_or(
+            mask,
+            cv2.inRange(
+                hsv,
+                np.array(lower, dtype=np.uint8),
+                np.array(upper, dtype=np.uint8),
+            ),
+        )
 
-    lower2 = np.array([170,120,70])
-    upper2 = np.array([180,255,255])
-
-    mask1 = cv2.inRange(hsv,lower1,upper1)
-    mask2 = cv2.inRange(hsv,lower2,upper2)
-    mask = mask1 + mask2
-
-    mask = cv2.medianBlur(mask,5)
+    mask = cv2.medianBlur(mask, 5)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
 
     contours,_ = cv2.findContours(mask,
                                   cv2.RETR_EXTERNAL,
                                   cv2.CHAIN_APPROX_SIMPLE)
 
+    contours = [c for c in contours if cv2.contourArea(c) > 80]
     if len(contours) == 0:
-        return None
+        return None, mask
 
     c = max(contours,key=cv2.contourArea)
 
     M = cv2.moments(c)
 
     if M["m00"] == 0:
-        return None
+        return None, mask
 
     cx = int(M["m10"]/M["m00"])
     cy = int(M["m01"]/M["m00"])
 
-    return cx,cy
+    return (cx,cy), mask
 
 
 # ------------------------------------------------
@@ -156,12 +189,28 @@ def collect_calibration():
             ret, frame = cam.read()
             frame = cv2.remap(frame, map1, map2, cv2.INTER_LINEAR)
 
-            center = detect_red_center(frame)
+            center, mask = detect_red_center(frame)
 
             if center is not None:
                 u, v = center
                 cv2.circle(frame, (u,v), 6, (0,255,0), -1)
+                cv2.putText(frame,
+                            "Marker locked - press SPACE",
+                            (30,75),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.7,
+                            (0,255,0),
+                            2)
                 detected = center
+            else:
+                detected = None
+                cv2.putText(frame,
+                            "No red marker detected",
+                            (30,75),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.7,
+                            (0,0,255),
+                            2)
 
             cv2.putText(frame,
                         "Place marker. SPACE to save",
@@ -172,6 +221,7 @@ def collect_calibration():
                         2)
 
             cv2.imshow("Calibration", frame)
+            cv2.imshow("Red Marker Mask", mask)
 
             key = cv2.waitKey(1) & 0xFF
 
@@ -179,6 +229,8 @@ def collect_calibration():
                 print("Saved pixel:", detected)
                 pixel_points.append(detected)
                 break
+            elif key == 32:
+                print("SPACE pressed, but no red marker is detected. Move marker into view or improve lighting.")
 
     return np.array(pixel_points, dtype=np.float32)
 

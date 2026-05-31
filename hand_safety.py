@@ -22,6 +22,7 @@ from mediapipe.tasks.python import BaseOptions
 import mediapipe as mp
 import sys
 import os
+import time
 
 MODEL_PATH = "hand_landmarker.task"
 _HAND_CONNECTIONS = frozenset([
@@ -35,21 +36,32 @@ _HAND_CONNECTIONS = frozenset([
 
 
 class HandSafety:
-    def __init__(self, model_path=MODEL_PATH, min_hand_detection_confidence=0.5):
+    def __init__(self, model_path=MODEL_PATH, min_hand_detection_confidence=0.25):
         if not os.path.exists(model_path):
             raise FileNotFoundError(
                 f"Hand landmarker model not found: {model_path}\n"
                 f"Download from: https://storage.googleapis.com/mediapipe-models/"
                 f"hand_landmarker/hand_landmarker/float16/latest/hand_landmarker.task"
             )
-        options = vision.HandLandmarkerOptions(
-            base_options=BaseOptions(model_asset_path=model_path),
-            running_mode=vision.RunningMode.IMAGE,
-            min_hand_detection_confidence=min_hand_detection_confidence,
-            num_hands=2,
-        )
+        options_kwargs = {
+            "base_options": BaseOptions(model_asset_path=model_path),
+            "running_mode": vision.RunningMode.VIDEO,
+            "min_hand_detection_confidence": min_hand_detection_confidence,
+            "num_hands": 2,
+        }
+        for key, value in {
+            "min_hand_presence_confidence": 0.25,
+            "min_tracking_confidence": 0.25,
+        }.items():
+            try:
+                vision.HandLandmarkerOptions(**{**options_kwargs, key: value})
+                options_kwargs[key] = value
+            except TypeError:
+                pass
+        options = vision.HandLandmarkerOptions(**options_kwargs)
         self._detector = vision.HandLandmarker.create_from_options(options)
         self._mp_image_format = mp.ImageFormat.SRGB
+        self._last_timestamp_ms = 0
 
     def detect(self, frame):
         """
@@ -61,7 +73,11 @@ class HandSafety:
         """
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         image = mp.Image(image_format=self._mp_image_format, data=rgb)
-        result = self._detector.detect(image)
+        timestamp_ms = int(time.perf_counter() * 1000)
+        if timestamp_ms <= self._last_timestamp_ms:
+            timestamp_ms = self._last_timestamp_ms + 1
+        self._last_timestamp_ms = timestamp_ms
+        result = self._detector.detect_for_video(image, timestamp_ms)
         return result.hand_landmarks, result.handedness
 
     def hand_detected(self, frame):

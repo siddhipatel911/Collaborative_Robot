@@ -25,7 +25,33 @@ def build_board():
     )
     return board, aruco_dict
 
-def calibrate(camera_index: int = CAMERA_INDEX):
+def find_camera(max_index=6, preferred_index=1):
+    available = []
+    for idx in range(max_index):
+        test = cv2.VideoCapture(idx, cv2.CAP_DSHOW)
+        if test.isOpened():
+            ret, frame = test.read()
+            if ret and frame is not None:
+                available.append(idx)
+        test.release()
+    if not available:
+        return None
+    return preferred_index if preferred_index in available else available[0]
+
+
+def open_camera(camera_index=None):
+    if camera_index is None:
+        camera_index = find_camera()
+    if camera_index is None:
+        raise RuntimeError("Cannot find a readable camera")
+    cap = cv2.VideoCapture(camera_index, cv2.CAP_DSHOW)
+    if not cap.isOpened():
+        raise RuntimeError(f"Cannot open camera index {camera_index}")
+    print(f"[CAMERA] Using index {camera_index}")
+    return cap, camera_index
+
+
+def calibrate(camera_index=None):
     board, aruco_dict = build_board()
 
     # ── IMPROVED DETECTOR: sub-pixel refinement (big accuracy boost) ──
@@ -47,9 +73,7 @@ def calibrate(camera_index: int = CAMERA_INDEX):
     image_size = None
     captured = 0
 
-    cap = cv2.VideoCapture(camera_index)
-    if not cap.isOpened():
-        raise RuntimeError(f"Cannot open camera index {camera_index}")
+    cap, camera_index = open_camera(camera_index)
 
     print("\n──────────────────────────────────────────────")
     print(" CALIBRATION MODE (ArUco GridBoard 4×4) - IMPROVED")
@@ -189,7 +213,7 @@ def _run_calibration(all_obj_points, all_img_points, image_size):
     print(f"\n Saved to -> {OUTPUT_FILE}\n")
 
 # preview_undistort is unchanged (still works with the new .npz)
-def preview_undistort(camera_index: int = CAMERA_INDEX):
+def preview_undistort(camera_index=None):
     if not os.path.exists(OUTPUT_FILE):
         print(f"No calibration file found: {OUTPUT_FILE}\nRun with --calibrate first.")
         return
@@ -197,13 +221,11 @@ def preview_undistort(camera_index: int = CAMERA_INDEX):
     data = np.load(OUTPUT_FILE)
     camera_matrix = data["camera_matrix"]
     dist_coeffs = data["dist_coeffs"]
-    rms = float(data["rms_error"])
+    rms = float(np.asarray(data["rms_error"]).reshape(-1)[0])
 
     print(f"\n Loaded calibration | FINAL RMS error: {rms:.4f}")
 
-    cap = cv2.VideoCapture(camera_index)
-    if not cap.isOpened():
-        raise RuntimeError(f"Cannot open camera index {camera_index}")
+    cap, camera_index = open_camera(camera_index)
 
     print("\n UNDISTORT PREVIEW | Press [Q] to quit\n")
 
@@ -245,7 +267,7 @@ if __name__ == "__main__":
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--calibrate", action="store_true", help="Run calibration + auto outlier removal")
     group.add_argument("--preview", action="store_true", help="Live undistort preview")
-    parser.add_argument("--camera", type=int, default=CAMERA_INDEX, help="Webcam index")
+    parser.add_argument("--camera", type=int, default=None, help="Webcam index (default: auto, preferring 1)")
     args = parser.parse_args()
 
     if args.calibrate:
