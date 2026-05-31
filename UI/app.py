@@ -11,7 +11,6 @@ app = Flask(__name__, static_folder='.', template_folder='.')
 
 def find_camera(max_index=4):
     """Auto-detect cameras, prefer index 1 (external USB).
-
     Avoid using the Windows-only CAP_DSHOW flag on macOS/Linux.
     """
     available = []
